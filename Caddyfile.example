@@ -1,0 +1,42 @@
+# ============================================================
+# Cloud Clip Lite — Caddy 配置示例
+# 自动 HTTPS（Let's Encrypt），反向代理到后端
+# ============================================================
+
+# 将 clip.example.com 替换为你的域名
+
+clip.example.com {
+    # 反向代理到后端服务
+    reverse_proxy server:8080
+
+    # WebSocket 支持（Caddy 自动处理，无需额外配置）
+
+    # 安全头
+    header {
+        # HSTS
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        # 防止 MIME 类型嗅探
+        X-Content-Type-Options "nosniff"
+        # 防止点击劫持
+        X-Frame-Options "DENY"
+        # XSS 保护
+        X-XSS-Protection "1; mode=block"
+        # 引用策略
+        Referrer-Policy "strict-origin-when-cross-origin"
+        # 移除 Server 头
+        -Server
+    }
+
+    # 静态文件缓存（前端资源）
+    @static path /assets/*
+    header @static Cache-Control "public, max-age=31536000, immutable"
+
+    # 压缩
+    encode gzip zstd
+
+    # 日志
+    log {
+        output stdout
+        format json
+    }
+}
