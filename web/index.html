@@ -5,6 +5,22 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="referrer" content="strict-origin-when-cross-origin" />
     <title>Cloud Clip</title>
+    <script>
+      // 首屏绘制前应用主题，避免刷新时暗/亮主题闪烁（FOUC）
+      (function () {
+        try {
+          var t = localStorage.getItem('cloud-clip-theme');
+          if (t !== 'light' && t !== 'dark') t = 'dark';
+          document.documentElement.setAttribute('data-theme', t);
+        } catch (e) {
+          document.documentElement.setAttribute('data-theme', 'dark');
+        }
+      })();
+    </script>
+    <style>
+      html { background-color: #0a0f1e; }
+      html[data-theme="light"] { background-color: #f8fafc; }
+    </style>
   </head>
   <body>
     <div id="root"></div>

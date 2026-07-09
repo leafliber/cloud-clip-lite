@@ -1,21 +1,22 @@
 /**
  * 安全与格式化工具集
- * - 所有用户输入在渲染前需经过 sanitizeText 处理，禁止使用 dangerouslySetInnerHTML
+ * - 渲染用户文本时依赖 React 文本节点的自动转义（textContent），无需手动转义
+ * - 全项目禁止使用 dangerouslySetInnerHTML
  */
 
 /**
- * 转义 HTML 特殊字符，防止 XSS。
- * 用于将用户输入以纯文本形式安全地插入 DOM（配合 React 文本节点使用）。
+ * 用户文本透传。
+ *
+ * React 在渲染文本节点时会自动转义 < > & " '（通过 textContent / createTextNode，
+ * 浏览器不会将其解析为 HTML），因此此处无需、也不应再次手动转义——手动转义会导致
+ * `&lt;` 等实体被二次转义，在界面上显示为字面量 `&lt;`。
+ *
+ * 保留该函数用于在调用处显式标注“此处渲染的是用户可控文本”，实质为恒等映射，
+ * 安全性由 React 文本节点保证。如需移除，可直接替换为原始字符串。
  */
 export function sanitizeText(text: string): string {
   if (text === null || text === undefined) return '';
-  return String(text)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#x27;')
-    .replace(/\//g, '&#x2F;');
+  return String(text);
 }
 
 /**

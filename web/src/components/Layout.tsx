@@ -88,35 +88,45 @@ export function Layout() {
       {/* 侧边栏 */}
       <aside
         className={cn(
-          'fixed inset-y-0 left-0 z-40 flex flex-col border-r transition-all duration-300 md:static md:translate-x-0',
+          'fixed inset-y-0 left-0 z-40 flex flex-col overflow-hidden border-r transition-[width,transform] duration-300 md:static md:translate-x-0',
           'border-[var(--border-default)] bg-[var(--bg-elevated)]',
           sidebarWidth,
           sidebarOpen ? 'translate-x-0' : '-translate-x-full',
         )}
       >
-        {/* Logo */}
-        <div className={cn('flex h-16 items-center border-b border-[var(--border-subtle)]', collapsed ? 'justify-center px-2' : 'gap-2.5 px-5')}>
-          <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl text-white" style={{ background: 'linear-gradient(135deg, var(--brand-500), var(--brand-700))' }}>
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" /><rect x="8" y="2" width="8" height="4" rx="1" /></svg>
+        {/* Logo 行：图标+文字居左，折叠箭头居右（与文字同行，不再单独占一行）。
+            折叠态下宽度仅 68px，容不下箭头，故箭头隐藏、改为点击图标区展开。 */}
+        <div className="flex h-16 shrink-0 items-center justify-between gap-2 overflow-hidden whitespace-nowrap border-b border-[var(--border-subtle)] px-4">
+          <div
+            className={cn('flex min-w-0 items-center gap-2.5', collapsed && 'cursor-pointer')}
+            onClick={collapsed ? () => setCollapsed(false) : undefined}
+            role={collapsed ? 'button' : undefined}
+            tabIndex={collapsed ? 0 : undefined}
+            aria-label={collapsed ? '展开侧边栏' : undefined}
+            onKeyDown={collapsed ? (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setCollapsed(false); } } : undefined}
+          >
+            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl text-white" style={{ background: 'linear-gradient(135deg, var(--brand-500), var(--brand-700))' }}>
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2" /><rect x="8" y="2" width="8" height="4" rx="1" /></svg>
+            </div>
+            {!collapsed && (
+              <div className="flex min-w-0 flex-col">
+                <span className="text-[15px] font-bold tracking-tight text-[var(--text-primary)]">Cloud Clip</span>
+                <span className="text-[10px] text-[var(--text-muted)]">轻量云剪切板</span>
+              </div>
+            )}
           </div>
           {!collapsed && (
-            <div className="flex flex-col">
-              <span className="text-[15px] font-bold tracking-tight text-[var(--text-primary)]">Cloud Clip</span>
-              <span className="text-[10px] text-[var(--text-muted)]">轻量云剪切板</span>
-            </div>
+            <button
+              onClick={() => setCollapsed(true)}
+              className="hidden shrink-0 items-center justify-center rounded-md p-1.5 text-[var(--text-muted)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] md:inline-flex"
+              aria-label="折叠侧边栏"
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="15 18 9 12 15 6" />
+              </svg>
+            </button>
           )}
         </div>
-
-        {/* 折叠按钮 */}
-        <button
-          onClick={() => setCollapsed((v) => !v)}
-          className={cn('hidden items-center justify-center border-b border-[var(--border-subtle)] py-2 text-[var(--text-muted)] transition-colors hover:text-[var(--text-primary)] md:flex')}
-          aria-label="折叠侧边栏"
-        >
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ transform: collapsed ? 'rotate(180deg)' : 'none', transition: 'transform 0.3s' }}>
-            <polyline points="15 18 9 12 15 6" />
-          </svg>
-        </button>
 
         {/* 导航 */}
         <nav className="flex-1 space-y-1 overflow-y-auto p-3">
@@ -124,7 +134,7 @@ export function Layout() {
             {userNav.map((item) => (
               <NavLink key={item.to} to={item.to} end={item.to === '/'} className={navLinkClass} title={collapsed ? item.label : undefined}>
                 <span className="shrink-0">{item.icon}</span>
-                {!collapsed && <span>{item.label}</span>}
+                {!collapsed && <span className="whitespace-nowrap">{item.label}</span>}
               </NavLink>
             ))}
           </div>
@@ -137,7 +147,7 @@ export function Layout() {
                 {adminNav.map((item) => (
                   <NavLink key={item.to} to={item.to} end={item.to === '/admin'} className={navLinkClass} title={collapsed ? item.label : undefined}>
                     <span className="shrink-0">{item.icon}</span>
-                    {!collapsed && <span>{item.label}</span>}
+                    {!collapsed && <span className="whitespace-nowrap">{item.label}</span>}
                   </NavLink>
                 ))}
               </div>

@@ -3,6 +3,7 @@ import React, {
   useCallback,
   useContext,
   useEffect,
+  useMemo,
   useState,
   type ButtonHTMLAttributes,
   type InputHTMLAttributes,
@@ -27,6 +28,7 @@ const s = {
   borderDefault: 'border-[var(--border-default)]',
   borderSubtle: 'border-[var(--border-subtle)]',
   textPrimary: 'text-[var(--text-primary)]',
+  hoverTextPrimary: 'hover:text-[var(--text-primary)]',
   textSecondary: 'text-[var(--text-secondary)]',
   textMuted: 'text-[var(--text-muted)]',
 };
@@ -71,7 +73,7 @@ export function Button({
     primary: 'text-white shadow-sm hover:shadow-md',
     secondary: `${s.textPrimary} ${s.bgSurface} ${s.borderDefault} border ${s.bgHover}`,
     danger: 'bg-[var(--danger)] text-white shadow-sm hover:brightness-110',
-    ghost: `bg-transparent ${s.textSecondary} ${s.bgHover} hover:${s.textPrimary}`,
+    ghost: `bg-transparent ${s.textSecondary} ${s.bgHover} ${s.hoverTextPrimary}`,
     outline: `${s.borderDefault} border bg-transparent ${s.textPrimary} ${s.bgHover}`,
   };
   const sizes: Record<ButtonSize, string> = {
@@ -294,8 +296,12 @@ export function Modal({ open, onClose, title, children, className, closeOnBackdr
   const maxW = { sm: 'max-w-sm', md: 'max-w-lg', lg: 'max-w-2xl', xl: 'max-w-4xl' }[size];
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 animate-fade-in" onMouseDown={(e) => { if (closeOnBackdrop && e.target === e.currentTarget) onClose(); }}>
-      <div className="absolute inset-0 bg-black/50 backdrop-blur-sm" aria-hidden="true" />
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 animate-fade-in">
+      <div
+        className="absolute inset-0 bg-black/50 backdrop-blur-sm"
+        aria-hidden="true"
+        onMouseDown={closeOnBackdrop ? onClose : undefined}
+      />
       <div
         role="dialog"
         aria-modal="true"
@@ -304,7 +310,7 @@ export function Modal({ open, onClose, title, children, className, closeOnBackdr
         {title && (
           <div className={cn('flex items-center justify-between border-b px-6 py-4', s.borderSubtle)}>
             <h2 className={cn('text-lg font-semibold', s.textPrimary)}>{title}</h2>
-            <button onClick={onClose} aria-label="关闭" className={cn('rounded-lg p-1.5 transition-colors', s.textMuted, s.bgHover, 'hover:' + s.textPrimary)}>
+            <button onClick={onClose} aria-label="关闭" className={cn('rounded-lg p-1.5 transition-colors', s.textMuted, s.bgHover, s.hoverTextPrimary)}>
               <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
             </button>
           </div>
@@ -375,11 +381,13 @@ export function ToastProvider({ children }: { children: ReactNode }) {
     setTimeout(() => remove(id), 3500);
   }, [remove]);
 
-  const methods: ToastApi = {
-    show, success: (m) => show(m, 'success'), error: (m) => show(m, 'error'),
-    info: (m) => show(m, 'info'), warning: (m) => show(m, 'warning'),
-  };
-  const value: ToastContextValue = { ...methods, toast: methods };
+  // 稳定化 methods/value 引用：避免每次渲染生成新对象，导致依赖 toast 的
+  // useCallback/useEffect 反复重跑（曾引发每次按键都重连 WS / 重新拉取列表的问题）
+  const methods = useMemo<ToastApi>(() => ({
+    show, success: (m: string) => show(m, 'success'), error: (m: string) => show(m, 'error'),
+    info: (m: string) => show(m, 'info'), warning: (m: string) => show(m, 'warning'),
+  }), [show]);
+  const value = useMemo<ToastContextValue>(() => ({ ...methods, toast: methods }), [methods]);
 
   const icons: Record<ToastType, ReactNode> = {
     success: <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12" /></svg>,
@@ -403,7 +411,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
           >
             <span className={cn('mt-0.5 shrink-0', colors[t.type])}>{icons[t.type]}</span>
             <span className="flex-1 break-words">{t.message}</span>
-            <button onClick={() => remove(t.id)} className={cn('shrink-0 transition-colors', s.textMuted, 'hover:' + s.textPrimary)} aria-label="关闭">
+            <button onClick={() => remove(t.id)} className={cn('shrink-0 transition-colors', s.textMuted, s.hoverTextPrimary)} aria-label="关闭">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
             </button>
           </div>
