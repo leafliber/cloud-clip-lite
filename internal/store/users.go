@@ -118,6 +118,25 @@ func (s *Store) UpdateUserRole(ctx context.Context, userID int64, role string) e
 	return s.assertAffected(res)
 }
 
+// UpdateUserEmail 更新用户邮箱（空串转为 NULL）
+// 邮箱唯一约束冲突时返回 ErrEmailExists
+func (s *Store) UpdateUserEmail(ctx context.Context, userID int64, email string) error {
+	var emailArg any
+	if email != "" {
+		emailArg = email
+	}
+	query := fmt.Sprintf(`UPDATE users SET email = %s, updated_at = %s WHERE id = %s`,
+		s.ph(1), s.now(), s.ph(2))
+	res, err := s.db.ExecContext(ctx, query, emailArg, userID)
+	if err != nil {
+		if isUniqueViolation(err) {
+			return ErrEmailExists
+		}
+		return fmt.Errorf("更新用户邮箱失败: %w", err)
+	}
+	return s.assertAffected(res)
+}
+
 // UpdateUserStatus 更新用户状态
 func (s *Store) UpdateUserStatus(ctx context.Context, userID int64, status string) error {
 	query := fmt.Sprintf(`UPDATE users SET status = %s, updated_at = %s WHERE id = %s`,

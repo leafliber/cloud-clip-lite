@@ -174,3 +174,79 @@ func TestSniffContentType(t *testing.T) {
 		t.Errorf("SniffContentType = %s, 期望 text/plain; charset=utf-8", mime)
 	}
 }
+
+func TestDetectMIME_RIFF(t *testing.T) {
+	// RIFF 容器按 offset 8-12 的格式标签区分
+	webp := []byte("RIFF\x24\x00\x00\x00WEBPVP8 ")
+	if mime := DetectMIME(webp); mime != "image/webp" {
+		t.Errorf("DetectMIME(WEBP) = %s, 期望 image/webp", mime)
+	}
+
+	wav := []byte("RIFF\x24\x00\x00\x00WAVEfmt ")
+	if mime := DetectMIME(wav); mime != "audio/wav" {
+		t.Errorf("DetectMIME(WAVE) = %s, 期望 audio/wav", mime)
+	}
+
+	// 未知 RIFF 子格式
+	avi := []byte("RIFF\x24\x00\x00\x00AVI LIST")
+	if mime := DetectMIME(avi); mime != "application/octet-stream" {
+		t.Errorf("DetectMIME(AVI) = %s, 期望 application/octet-stream", mime)
+	}
+}
+
+func TestValidateMIME_WavDeclared(t *testing.T) {
+	// WAV 内容声明 audio/wav 应通过（此前 wav 魔数是死代码）
+	wav := []byte("RIFF\x24\x00\x00\x00WAVEfmt ")
+	detected, ok := ValidateMIME("audio/wav", wav)
+	if !ok {
+		t.Error("WAV 内容声明 audio/wav 应匹配")
+	}
+	if detected != "audio/wav" {
+		t.Errorf("detected = %s, 期望 audio/wav", detected)
+	}
+
+	// WebP 内容声明 audio/wav 应拒绝
+	webp := []byte("RIFF\x24\x00\x00\x00WEBPVP8 ")
+	if _, ok := ValidateMIME("audio/wav", webp); ok {
+		t.Error("WebP 内容声明 audio/wav 不应匹配")
+	}
+}
+
+func TestValidateMIME_HTMLDisguised(t *testing.T) {
+	html := []byte("<html><head><title>x</title></head><body>evil</body></html>")
+
+	// HTML 无魔数，声明成白名单类型（图片/纯文本）应被二次嗅探拦截
+	for _, declared := range []string{"image/png", "text/plain", "application/octet-stream"} {
+		detected, ok := ValidateMIME(declared, html)
+		if ok {
+			t.Errorf("HTML 内容声明 %s 应被拒绝", declared)
+		}
+		if detected != "text/html" {
+			t.Errorf("detected = %s, 期望 text/html", detected)
+		}
+	}
+}
+
+func TestValidateMIME_BinaryFallback(t *testing.T) {
+	// 未知二进制内容仍信任声明
+	binary := []byte{0x00, 0x01, 0x02, 0x03, 0xFF, 0xFE}
+	if _, ok := ValidateMIME("application/octet-stream", binary); !ok {
+		t.Error("未知二进制应信任声明")
+	}
+}
+
+func TestMIMEByExtension_Uppercase(t *testing.T) {
+	tests := []struct {
+		filename string
+		expected string
+	}{
+		{"PHOTO.PNG", "image/png"},
+		{"Doc.PDF", "application/pdf"},
+		{"ARCHIVE.TAR.GZ", "application/x-gzip"},
+	}
+	for _, tt := range tests {
+		if got := MIMEByExtension(tt.filename); got != tt.expected {
+			t.Errorf("MIMEByExtension(%s) = %s, 期望 %s", tt.filename, got, tt.expected)
+		}
+	}
+}

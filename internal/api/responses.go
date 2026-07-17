@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 
 	"github.com/leaf/cloud-clip-lite/internal/store"
@@ -38,10 +39,16 @@ func writeErrorWithExtra(w http.ResponseWriter, status int, code, message string
 }
 
 // handleError 根据 store 错误类型自动映射 HTTP 状态码
+// 已知的类型化错误维持映射；未知内部错误对外返回固定文案（避免泄露 SQL 等细节），原文仅记日志
 func handleError(w http.ResponseWriter, err error) {
 	if errors.Is(err, store.ErrNotFound) {
 		writeError(w, http.StatusNotFound, "NOT_FOUND", "资源不存在")
 		return
 	}
-	writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", err.Error())
+	if errors.Is(err, store.ErrEmailExists) {
+		writeError(w, http.StatusConflict, "EMAIL_EXISTS", "邮箱已被使用")
+		return
+	}
+	slog.Default().Error("内部错误", "error", err)
+	writeError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "内部服务器错误")
 }

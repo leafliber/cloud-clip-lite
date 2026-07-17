@@ -15,14 +15,24 @@ type Handler struct {
 	store     *store.Store
 	startTime time.Time
 	ready     *atomic.Bool
+	version   string
 }
 
-// New 创建健康检查处理器
+// New 创建健康检查处理器（版本默认 "dev"，由 main 通过 NewWithVersion 注入构建版本）
 func New(s *store.Store, ready *atomic.Bool) *Handler {
+	return NewWithVersion(s, ready, "dev")
+}
+
+// NewWithVersion 创建健康检查处理器并指定版本号
+func NewWithVersion(s *store.Store, ready *atomic.Bool, version string) *Handler {
+	if version == "" {
+		version = "dev"
+	}
 	return &Handler{
 		store:     s,
 		startTime: time.Now(),
 		ready:     ready,
+		version:   version,
 	}
 }
 
@@ -42,7 +52,7 @@ func (h *Handler) Liveness(w http.ResponseWriter, r *http.Request) {
 		Status:    "ok",
 		Uptime:    time.Since(h.startTime).Round(time.Second).String(),
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
-		Version:   "0.1.0",
+		Version:   h.version,
 	})
 }
 
@@ -55,7 +65,7 @@ func (h *Handler) Readiness(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"status":  "not_ready",
 			"reason":  "服务未就绪",
-			"version": "0.1.0",
+			"version": h.version,
 		})
 		return
 	}
@@ -68,7 +78,7 @@ func (h *Handler) Readiness(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"status":  "degraded",
 			"reason":  "数据库不可达",
-			"version": "0.1.0",
+			"version": h.version,
 		})
 		return
 	}
@@ -78,7 +88,7 @@ func (h *Handler) Readiness(w http.ResponseWriter, r *http.Request) {
 		Status:    "ok",
 		Uptime:    time.Since(h.startTime).Round(time.Second).String(),
 		Timestamp: time.Now().UTC().Format(time.RFC3339),
-		Version:   "0.1.0",
+		Version:   h.version,
 	})
 }
 

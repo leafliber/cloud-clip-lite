@@ -289,3 +289,82 @@ func TestAdmin_ListAuditLogs(t *testing.T) {
 		t.Error("应包含 admin.user.status_update 日志")
 	}
 }
+
+func TestAdmin_UpdateUser_SelfRoleStatus_Forbidden(t *testing.T) {
+	handler, st := apiTestSetup(t, "open")
+	adminToken := loginAsAdmin(t, handler, st)
+
+	admin, _ := st.GetUserByUsername(context.Background(), "testadmin")
+
+	// 修改自己的 role 应 400
+	rec := doRequest(handler, "PATCH", fmt.Sprintf("/api/admin/users/%d", admin.ID), map[string]any{
+		"role": "user",
+	}, adminToken)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("改自己 role: 状态码 = %d, 期望 400", rec.Code)
+	}
+
+	// 修改自己的 status 应 400
+	rec = doRequest(handler, "PATCH", fmt.Sprintf("/api/admin/users/%d", admin.ID), map[string]any{
+		"status": "disabled",
+	}, adminToken)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("改自己 status: 状态码 = %d, 期望 400", rec.Code)
+	}
+
+	// 修改自己的配额应放行
+	rec = doRequest(handler, "PATCH", fmt.Sprintf("/api/admin/users/%d", admin.ID), map[string]any{
+		"quota_bytes": int64(2147483648),
+	}, adminToken)
+	if rec.Code != http.StatusOK {
+		t.Errorf("改自己配额: 状态码 = %d, 期望 200, body: %s", rec.Code, rec.Body.String())
+	}
+
+	// 确认 role/status 未被改动
+	updated, _ := st.GetUserByID(context.Background(), admin.ID)
+	if updated.Role != "admin" || updated.Status != "active" {
+		t.Errorf("role=%s status=%s, 期望 admin/active 不变", updated.Role, updated.Status)
+	}
+}
+
+func TestAdmin_UpdateUser_InvalidValues(t *testing.T) {
+	handler, st := apiTestSetup(t, "open")
+	adminToken := loginAsAdmin(t, handler, st)
+
+	hasher := auth.NewPasswordHasher(auth.DefaultArgon2Params())
+	hash, _ := hasher.Hash("password123")
+	target, _ := st.CreateUser(context.Background(), &store.User{Username: "valuser", PasswordHash: hash})
+
+	tests := []struct {
+		name string
+		body map[string]any
+	}{
+		{"单条上限为 0", map[string]any{"max_item_size": int64(0)}},
+		{"单条上限为负", map[string]any{"max_item_size": int64(-5)}},
+		{"总配额为 0", map[string]any{"quota_bytes": int64(0)}},
+		{"总配额为负", map[string]any{"quota_bytes": int64(-1)}},
+		{"保留天数为 0", map[string]any{"retention_days": 0}},
+		{"保留天数超上限", map[string]any{"retention_days": 3651}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := doRequest(handler, "PATCH", fmt.Sprintf("/api/admin/users/%d", target.ID), tt.body, adminToken)
+			if rec.Code != http.StatusBadRequest {
+				t.Errorf("状态码 = %d, 期望 400", rec.Code)
+			}
+		})
+	}
+
+	// 全部字段校验通过前不落库：role 合法但 status 非法时 role 也不应生效
+	rec := doRequest(handler, "PATCH", fmt.Sprintf("/api/admin/users/%d", target.ID), map[string]any{
+		"role":   "admin",
+		"status": "bogus",
+	}, adminToken)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("状态码 = %d, 期望 400", rec.Code)
+	}
+	updated, _ := st.GetUserByID(context.Background(), target.ID)
+	if updated.Role != "user" {
+		t.Errorf("校验失败时 role 不应落库, 实际 role = %s", updated.Role)
+	}
+}

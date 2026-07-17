@@ -70,7 +70,7 @@ func (s *Store) ListAuditLogs(ctx context.Context, userID int64, action string, 
 	}
 
 	query := fmt.Sprintf(`SELECT id, user_id, device_id, action, target, ip, ua, meta, created_at
-		FROM audit_logs WHERE %s ORDER BY created_at DESC LIMIT %s OFFSET %s`,
+		FROM audit_logs WHERE %s ORDER BY created_at DESC, id DESC LIMIT %s OFFSET %s`,
 		where, s.ph(idx), s.ph(idx+1))
 	args = append(args, limit, offset)
 

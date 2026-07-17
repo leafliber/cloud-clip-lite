@@ -5,12 +5,16 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/leaf/cloud-clip-lite/internal/db"
 )
 
 // ErrNotFound 通用未找到错误
 var ErrNotFound = errors.New("记录不存在")
+
+// ErrEmailExists 邮箱已被其他用户使用（唯一约束冲突）
+var ErrEmailExists = errors.New("邮箱已被使用")
 
 // Store 数据访问层：聚合各实体的查询方法
 type Store struct {
@@ -98,6 +102,14 @@ func (s *Store) booleanTrue() string {
 	return "TRUE"
 }
 
+// booleanFalse 返回当前方言的布尔假值
+func (s *Store) booleanFalse() string {
+	if s.db.Dialect == "sqlite" {
+		return "0"
+	}
+	return "FALSE"
+}
+
 // assertAffected 确认 SQL 影响了至少一行
 func (s *Store) assertAffected(res sql.Result) error {
 	n, err := res.RowsAffected()
@@ -108,4 +120,10 @@ func (s *Store) assertAffected(res sql.Result) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// isUniqueViolation 判断是否为唯一约束冲突（覆盖 SQLite 与 PG 的错误文案）
+func isUniqueViolation(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "UNIQUE") || strings.Contains(msg, "duplicate")
 }

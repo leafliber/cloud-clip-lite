@@ -79,6 +79,44 @@ func TestRateLimit_Middleware(t *testing.T) {
 	}
 }
 
+func TestRateLimit_ByIP_StripsPort(t *testing.T) {
+	rl := NewRateLimiter(60, 2)
+
+	handler := RateLimitByIP(rl)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	// 同一 IP 不同源端口应共享同一个限流桶
+	ports := []string{"50001", "50002"}
+	for i, port := range ports {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("GET", "/test", nil)
+		req.RemoteAddr = "1.2.3.4:" + port
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("第 %d 次请求（端口 %s）状态码 = %d, 期望 200", i+1, port, rec.Code)
+		}
+	}
+
+	// 第三次（又一个新端口）应触发限流
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.RemoteAddr = "1.2.3.4:50003"
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Errorf("同 IP 换端口后第 3 次请求应被限流, 状态码 = %d, 期望 429", rec.Code)
+	}
+
+	// 不带端口的 RemoteAddr（SplitHostPort 失败）应回退原始值，不 panic
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest("GET", "/test", nil)
+	req.RemoteAddr = "5.6.7.8"
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("无端口 RemoteAddr 状态码 = %d, 期望 200", rec.Code)
+	}
+}
+
 func TestRateLimit_ByUser(t *testing.T) {
 	rl := NewRateLimiter(60, 2)
 

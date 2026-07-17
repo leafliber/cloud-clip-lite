@@ -14,7 +14,7 @@ clip.example.com {
     # 安全头
     header {
         # HSTS
-        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
         # 防止 MIME 类型嗅探
         X-Content-Type-Options "nosniff"
         # 防止点击劫持

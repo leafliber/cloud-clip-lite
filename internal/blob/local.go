@@ -2,10 +2,12 @@ package blob
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // LocalStore 本地文件系统 BlobStore 实现
@@ -37,9 +39,9 @@ func (s *LocalStore) Save(ctx context.Context, reader io.Reader, blobKey string,
 		return 0, fmt.Errorf("创建 blob 目录失败: %w", err)
 	}
 
-	// 先写入临时文件，成功后重命名
+	// 先写入临时文件（0600：剪切板内容可能含敏感信息，仅属主可读写），成功后重命名
 	tmpPath := fullPath + ".tmp"
-	f, err := os.Create(tmpPath)
+	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return 0, fmt.Errorf("创建临时文件失败: %w", err)
 	}
@@ -52,7 +54,7 @@ func (s *LocalStore) Save(ctx context.Context, reader io.Reader, blobKey string,
 
 	if err != nil {
 		_ = os.Remove(tmpPath)
-		if written >= maxBytes {
+		if errors.Is(err, ErrItemTooLarge) {
 			return written, ErrItemTooLarge
 		}
 		return 0, fmt.Errorf("写入 blob 失败: %w", err)
@@ -137,6 +139,48 @@ func (s *LocalStore) List(ctx context.Context) ([]string, error) {
 	return keys, nil
 }
 
+// ModTime 返回 blob 文件的修改时间（孤儿回收用于宽限期判断）
+func (s *LocalStore) ModTime(ctx context.Context, blobKey string) (time.Time, error) {
+	info, err := os.Stat(s.fullPath(blobKey))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return time.Time{}, ErrBlobNotFound
+		}
+		return time.Time{}, fmt.Errorf("获取 blob 信息失败: %w", err)
+	}
+	return info.ModTime(), nil
+}
+
+// CleanStaleTmpFiles 清理修改时间超过 maxAge 的残留 .tmp 临时文件，返回删除数量
+func (s *LocalStore) CleanStaleTmpFiles(ctx context.Context, maxAge time.Duration) (int, error) {
+	rootAbs, err := filepath.Abs(s.rootDir)
+	if err != nil {
+		return 0, fmt.Errorf("获取根目录绝对路径失败: %w", err)
+	}
+
+	cutoff := time.Now().Add(-maxAge)
+	removed := 0
+	err = filepath.Walk(rootAbs, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() || filepath.Ext(path) != ".tmp" {
+			return nil
+		}
+		if info.ModTime().After(cutoff) {
+			return nil
+		}
+		if err := os.Remove(path); err == nil {
+			removed++
+		}
+		return nil
+	})
+	if err != nil {
+		return removed, fmt.Errorf("遍历 blob 目录失败: %w", err)
+	}
+	return removed, nil
+}
+
 // ---------- 错误定义 ----------
 
 var (
@@ -147,6 +191,8 @@ var (
 )
 
 // maxBytesReader 限制最大读取字节数
+// 仿 http.MaxBytesReader：每次最多读到 max+1 字节，读满 max 后由探测读
+// 判断是否还有数据——恰好 max 字节时探测读拿到 EOF，属正常结束
 type maxBytesReader struct {
 	reader io.Reader
 	max    int64
@@ -154,15 +200,17 @@ type maxBytesReader struct {
 }
 
 func (r *maxBytesReader) Read(p []byte) (int, error) {
-	if r.read >= r.max {
-		return 0, ErrItemTooLarge
+	if len(p) == 0 {
+		return 0, nil
 	}
-	// 限制本次读取量
-	remaining := r.max - r.read
-	if int64(len(p)) > remaining {
-		p = p[:remaining]
+	// 剩余额度 +1 探测字节，超过该额度说明内容超限
+	if int64(len(p)) > r.max-r.read+1 {
+		p = p[:r.max-r.read+1]
 	}
 	n, err := r.reader.Read(p)
 	r.read += int64(n)
+	if r.read > r.max {
+		return n, ErrItemTooLarge
+	}
 	return n, err
 }

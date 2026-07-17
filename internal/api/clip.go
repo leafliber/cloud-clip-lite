@@ -114,8 +114,23 @@ func (h *ClipHandler) Create(w http.ResponseWriter, r *http.Request) {
 
 // createText 文本上传
 func (h *ClipHandler) createText(w http.ResponseWriter, r *http.Request, ac *middleware.AuthContext) {
+	// 先查用户配置，按其上限约束请求体总大小
+	user, err := h.store.GetUserByID(r.Context(), ac.UserID)
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+
+	// 限制请求体总大小（MaxItemSize + JSON 开销余量），避免超限 body 全部解码进内存
+	r.Body = http.MaxBytesReader(w, r.Body, user.MaxItemSize+textBodySlack)
 	var req createTextRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var mbErr *http.MaxBytesError
+		if errors.As(err, &mbErr) {
+			writeErrorWithExtra(w, http.StatusRequestEntityTooLarge, "ITEM_TOO_LARGE",
+				"文本超过单条上限", map[string]any{"limit": user.MaxItemSize})
+			return
+		}
 		writeError(w, http.StatusBadRequest, "INVALID_BODY", "请求体格式错误")
 		return
 	}
@@ -125,10 +140,9 @@ func (h *ClipHandler) createText(w http.ResponseWriter, r *http.Request, ac *mid
 		return
 	}
 
-	// 获取用户配置
-	user, err := h.store.GetUserByID(r.Context(), ac.UserID)
-	if err != nil {
-		handleError(w, err)
+	// 自定义过期秒数校验：防止绕过管理员保留策略与 time.Duration 乘法溢出
+	if req.ExpiresIn != nil && (*req.ExpiresIn <= 0 || *req.ExpiresIn > maxExpiresInSeconds) {
+		writeError(w, http.StatusBadRequest, "INVALID_EXPIRES_IN", "自定义过期秒数需在 1-315360000 之间")
 		return
 	}
 
@@ -193,10 +207,30 @@ func (h *ClipHandler) createText(w http.ResponseWriter, r *http.Request, ac *mid
 
 // createFile 文件/图片上传（multipart）
 func (h *ClipHandler) createFile(w http.ResponseWriter, r *http.Request, ac *middleware.AuthContext) {
+	// 先查用户配置，按其上限约束请求体总大小
+	user, err := h.store.GetUserByID(r.Context(), ac.UserID)
+	if err != nil {
+		handleError(w, err)
+		return
+	}
+
+	// 限制请求体总大小（MaxItemSize + 表单开销余量），超限部分不会全部落盘临时文件
+	r.Body = http.MaxBytesReader(w, r.Body, user.MaxItemSize+fileFormSlack)
+
 	// 限制 multipart 解析的内存
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		var mbErr *http.MaxBytesError
+		if errors.As(err, &mbErr) {
+			writeErrorWithExtra(w, http.StatusRequestEntityTooLarge, "ITEM_TOO_LARGE",
+				"文件超过单条上限", map[string]any{"limit": user.MaxItemSize})
+			return
+		}
 		writeError(w, http.StatusBadRequest, "PARSE_FAILED", "解析 multipart 表单失败")
 		return
+	}
+	// 解析成功后清理 multipart 落盘的临时文件
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
 	}
 
 	file, header, err := r.FormFile("file")
@@ -205,13 +239,6 @@ func (h *ClipHandler) createFile(w http.ResponseWriter, r *http.Request, ac *mid
 		return
 	}
 	defer file.Close()
-
-	// 获取用户配置
-	user, err := h.store.GetUserByID(r.Context(), ac.UserID)
-	if err != nil {
-		handleError(w, err)
-		return
-	}
 
 	// 大小校验（先检查 Content-Length，实际以流式为准）
 	maxSize := user.MaxItemSize
@@ -251,24 +278,32 @@ func (h *ClipHandler) createFile(w http.ResponseWriter, r *http.Request, ac *mid
 		declaredMIME = blob.MIMEByExtension(header.Filename)
 	}
 
-	// 读取已保存 blob 的头部进行 magic bytes 校验
+	// 读取已保存 blob 的头部进行 magic bytes 校验（读不出内容无法校验的上传直接拒绝，fail-closed）
 	detectedMIME := declaredMIME
 	blobReader, err := h.blob.Open(r.Context(), blobKey)
-	if err == nil {
-		headerBytes, _ := blob.ReadHeader(blobReader)
-		_ = blobReader.Close()
-		if len(headerBytes) > 0 {
-			detected, ok := blob.ValidateMIME(declaredMIME, headerBytes)
-			if !ok {
-				h.logger.Warn("MIME 类型不匹配",
-					"declared", declaredMIME,
-					"detected", detected,
-					"filename", header.Filename,
-				)
-			}
-			detectedMIME = detected
-		}
+	if err != nil {
+		_ = h.blob.Delete(r.Context(), blobKey)
+		h.logger.Error("回读 blob 进行 MIME 校验失败", "error", err, "key", blobKey)
+		writeError(w, http.StatusInternalServerError, "BLOB_READ_FAILED", "文件校验失败")
+		return
 	}
+	headerBytes, err := blob.ReadHeader(blobReader)
+	_ = blobReader.Close()
+	if err != nil || len(headerBytes) == 0 {
+		_ = h.blob.Delete(r.Context(), blobKey)
+		h.logger.Warn("读取文件头失败，拒绝上传", "error", err, "filename", header.Filename)
+		writeError(w, http.StatusBadRequest, "MIME_CHECK_FAILED", "无法读取文件内容进行类型校验")
+		return
+	}
+	detected, ok := blob.ValidateMIME(declaredMIME, headerBytes)
+	if !ok {
+		h.logger.Warn("MIME 类型不匹配",
+			"declared", declaredMIME,
+			"detected", detected,
+			"filename", header.Filename,
+		)
+	}
+	detectedMIME = detected
 
 	// 检查 MIME 类型是否在允许列表
 	if !blob.IsMIMEAllowed(detectedMIME) {
@@ -495,11 +530,11 @@ func (h *ClipHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 异步清理 blob
+	// 同步清理 blob（本地文件操作很快）；失败仅记日志，残留由每小时孤儿回收兜底
 	if deleted.BlobKey.Valid {
-		go func(key string) {
-			_ = h.blob.Delete(context.Background(), key)
-		}(deleted.BlobKey.String)
+		if err := h.blob.Delete(r.Context(), deleted.BlobKey.String); err != nil {
+			h.logger.Error("删除 blob 失败", "error", err, "key", deleted.BlobKey.String)
+		}
 	}
 
 	// 广播删除事件到用户的所有在线连接
@@ -524,7 +559,16 @@ func (h *ClipHandler) checkQuota(ctx context.Context, userID int64, newSize int6
 	return nil
 }
 
-// calculateExpiry 计算过期时间
+const (
+	// maxExpiresInSeconds 自定义过期秒数上限（3650 天），防止绕过保留策略与 time.Duration 乘法溢出
+	maxExpiresInSeconds = 3650 * 24 * 3600
+	// textBodySlack 文本上传请求体在 MaxItemSize 之上的 JSON 开销余量
+	textBodySlack = 1 << 20
+	// fileFormSlack 文件上传请求体在 MaxItemSize 之上的 multipart 表单开销余量
+	fileFormSlack = 1 << 20
+)
+
+// calculateExpiry 计算过期时间（UTC 写入，与 store 的 datetime('now') 口径一致）
 // customSeconds 非空时使用自定义过期，否则使用 retentionDays
 func (h *ClipHandler) calculateExpiry(retentionDays int, customSeconds *int) sql.NullString {
 	var dur time.Duration
@@ -533,7 +577,7 @@ func (h *ClipHandler) calculateExpiry(retentionDays int, customSeconds *int) sql
 	} else {
 		dur = time.Duration(retentionDays) * 24 * time.Hour
 	}
-	expires := time.Now().Add(dur)
+	expires := time.Now().UTC().Add(dur)
 	return sql.NullString{
 		String: expires.Format("2006-01-02 15:04:05"),
 		Valid:  true,

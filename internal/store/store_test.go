@@ -21,8 +21,6 @@ func newTestStore(t *testing.T) *Store {
 		SQLitePath: ":memory:",
 		JWTSecret:  "test-secret-at-least-32-bytes-long!!!",
 	}
-	// 强制内存模式：覆盖 SQLitePath
-	cfg.SQLitePath = ":memory:"
 
 	database, err := db.Open(ctx, cfg)
 	if err != nil {

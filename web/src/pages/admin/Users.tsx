@@ -189,9 +189,20 @@ export default function Users() {
       });
       // 兼容 {items} / {users} / 数组 三种返回格式
       const list = data.items ?? data.users ?? (Array.isArray(data) ? (data as User[]) : []);
+      // 空页（如末页满员后翻页、或末页数据被删空）时自动回退一页，避免分页死路
+      if (list.length === 0 && page > 0) {
+        setPage((p) => Math.max(0, p - 1));
+        return;
+      }
+      const totalCount = typeof data.total === 'number' ? data.total : list.length;
       setUsers(list);
-      setTotal(typeof data.total === 'number' ? data.total : list.length);
-      setHasMore(list.length === PAGE_SIZE);
+      setTotal(totalCount);
+      // 有 total 时按总数判断是否还有下一页；无 total 时退化为“满页即还有”
+      setHasMore(
+        typeof data.total === 'number'
+          ? offset + list.length < totalCount
+          : list.length === PAGE_SIZE,
+      );
     } catch (err) {
       setError(getErrorMessage(err, '用户列表加载失败'));
     } finally {
@@ -374,6 +385,8 @@ export default function Users() {
 
   const startIdx = page * PAGE_SIZE + 1;
   const endIdx = page * PAGE_SIZE + users.length;
+  // 编辑对象为当前登录管理员自己时，禁止修改角色/状态，防止唯一管理员自我降权
+  const editingIsSelf = editingUser !== null && currentUser?.id === editingUser.id;
 
   return (
     <div className="space-y-8 animate-fade-in">
@@ -600,8 +613,8 @@ export default function Users() {
         </Card>
       )}
 
-      {/* 分页 */}
-      {users.length > 0 && (
+      {/* 分页：只要总数非空就渲染，避免空页时控件整个消失无法返回 */}
+      {total > 0 && (
         <div className="flex items-center justify-between">
           <p className="text-sm text-[var(--text-muted)]">
             第 {page + 1} 页 · 每页 {PAGE_SIZE} 条
@@ -637,20 +650,26 @@ export default function Users() {
         size="lg"
       >
         <div className="space-y-4">
+          {editingIsSelf && (
+            <div className="flex items-start gap-2 rounded-lg border border-[var(--warning)]/40 bg-[var(--warning)]/10 px-3 py-2.5 text-xs text-[var(--warning)]">
+              <AlertTriangleIcon size={14} />
+              <span>不能修改自己的角色与状态，防止管理员自我降权或禁用。</span>
+            </div>
+          )}
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <Select
               label="角色"
               value={editForm.role}
               onChange={(e) => setEditForm((f) => ({ ...f, role: e.target.value as 'user' | 'admin' }))}
               options={ROLE_OPTIONS}
-              disabled={editLoading}
+              disabled={editLoading || editingIsSelf}
             />
             <Select
               label="状态"
               value={editForm.status}
               onChange={(e) => setEditForm((f) => ({ ...f, status: e.target.value as 'active' | 'disabled' }))}
               options={STATUS_OPTIONS}
-              disabled={editLoading}
+              disabled={editLoading || editingIsSelf}
             />
           </div>
           <Input

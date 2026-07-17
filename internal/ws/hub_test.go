@@ -1,4 +1,4 @@
-﻿package ws
+package ws
 
 import (
 	"encoding/json"
@@ -272,5 +272,39 @@ func TestHub_Stop(t *testing.T) {
 
 	// 重复 Stop 不应 panic
 	hub.Stop()
+}
+
+func TestHub_StopClosesConnectionSend(t *testing.T) {
+	hub := NewHub(slog.Default())
+	go hub.Run()
+	time.Sleep(10 * time.Millisecond)
+
+	conn1 := newTestConn(hub, 1, "user1")
+	conn2 := newTestConn(hub, 2, "user2")
+	hub.Register(conn1)
+	hub.Register(conn2)
+	time.Sleep(20 * time.Millisecond) // 等待注册完成
+
+	hub.Stop()
+	time.Sleep(20 * time.Millisecond)
+
+	// Stop 后已注册连接的 send channel 应被关闭（读立即返回 ok=false）
+	for i, conn := range []*Connection{conn1, conn2} {
+		select {
+		case _, ok := <-conn.send:
+			if ok {
+				t.Errorf("连接 %d 的 send channel 应已关闭", i+1)
+			}
+		default:
+			t.Errorf("连接 %d 的 send channel 应已关闭且可立即读取", i+1)
+		}
+	}
+
+	if hub.GetOnlineCount() != 0 {
+		t.Errorf("Stop 后在线数 = %d, 期望 0", hub.GetOnlineCount())
+	}
+	if hub.GetOnlineUserCount() != 0 {
+		t.Errorf("Stop 后在线用户数 = %d, 期望 0", hub.GetOnlineUserCount())
+	}
 }
 

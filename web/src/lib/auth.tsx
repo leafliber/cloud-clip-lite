@@ -6,7 +6,7 @@ import React, {
   useState,
   type ReactNode,
 } from 'react';
-import { api, tokenStorage } from './api';
+import { api, ApiClientError, tokenStorage } from './api';
 import { wsClient } from './ws';
 import type { AuthResponse, User } from '../types';
 
@@ -48,10 +48,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setUser(u);
       setAccessToken(tokenStorage.getAccessToken());
       return u;
-    } catch {
-      tokenStorage.clear();
-      setUser(null);
-      setAccessToken(null);
+    } catch (err) {
+      // 仅明确的 401 视为会话失效；网络错误/5xx 时保留本地凭证
+      // （服务器重启或断网不应销毁本地仍有效的 refresh token）
+      if (err instanceof ApiClientError && err.status === 401) {
+        tokenStorage.clear();
+        setUser(null);
+        setAccessToken(null);
+      }
       return null;
     }
   }, []);
@@ -67,9 +71,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             setUser(u);
             setAccessToken(tokenStorage.getAccessToken());
           }
-        } catch {
-          tokenStorage.clear();
-          if (!cancelled) setAccessToken(null);
+        } catch (err) {
+          // 与 refreshUser 一致：仅明确的 401 清除凭证，网络错误/5xx 保留
+          if (err instanceof ApiClientError && err.status === 401) {
+            tokenStorage.clear();
+            if (!cancelled) setAccessToken(null);
+          }
         }
       }
       if (!cancelled) setLoading(false);

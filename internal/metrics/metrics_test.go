@@ -123,3 +123,55 @@ func TestMetrics_Observe(t *testing.T) {
 	}
 }
 
+
+func TestMetrics_LabelOrderIndependent(t *testing.T) {
+	m := New()
+
+	// 相同 label 集、不同插入顺序，应归为同一个计数器
+	m.IncCounter("req", map[string]string{"method": "GET", "status": "200"})
+	m.IncCounter("req", map[string]string{"status": "200", "method": "GET"})
+
+	m.mu.Lock()
+	n := len(m.counters)
+	m.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("相同 label 集应只产生 1 个计数器, 实际 %d", n)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	m.Handler()(rec, req)
+	body := rec.Body.String()
+
+	// label 排序后输出稳定，且值为 2
+	if !strings.Contains(body, `cloud_clip_requests_total{method="GET",status="200"} 2`) {
+		t.Errorf("计数器输出不正确, body: %s", body)
+	}
+}
+
+func TestMetrics_HistogramBucketFormat(t *testing.T) {
+	m := New()
+	m.Observe("lat", 0.03, map[string]string{"path": "/api/clip"})
+	m.Observe("plain", 0.03, nil)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	m.Handler()(rec, req)
+	body := rec.Body.String()
+
+	// le 必须在花括号内（合法 exposition 格式），不允许出现 }_le= 或 _le= 拼接
+	if strings.Contains(body, "_le=") {
+		t.Errorf("bucket 行格式非法（le 在花括号外）, body: %s", body)
+	}
+	// 有 label 时 le 合入 label 集合（le 排序在 path 前）
+	if !strings.Contains(body, `cloud_clip_request_duration_seconds_bucket{le="0.05",path="/api/clip"} 1`) {
+		t.Errorf("带 label 的 bucket 行不正确, body: %s", body)
+	}
+	// 无 label 时输出 {le="..."}
+	if !strings.Contains(body, `cloud_clip_request_duration_seconds_bucket{le="0.05"} 1`) {
+		t.Errorf("无 label 的 bucket 行不正确, body: %s", body)
+	}
+	if !strings.Contains(body, `cloud_clip_request_duration_seconds_bucket{le="+Inf",path="/api/clip"} 1`) {
+		t.Errorf("+Inf bucket 行不正确, body: %s", body)
+	}
+}

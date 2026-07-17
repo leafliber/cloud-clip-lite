@@ -53,28 +53,42 @@ func (s *Store) CreateClipItem(ctx context.Context, item *ClipItem) (*ClipItem, 
 		VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)`,
 		s.ph(1), s.ph(2), s.ph(3), s.ph(4), s.ph(5), s.ph(6), s.ph(7), s.ph(8), s.ph(9), s.ph(10))
 
-	res, err := s.db.ExecContext(ctx, query,
-		item.UserID, deviceID, item.Type, mimeType, item.Size, blobKey, textContent, sha256, meta, expiresAt,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("创建 clip_item 失败: %w", err)
+	args := []any{item.UserID, deviceID, item.Type, mimeType, item.Size, blobKey, textContent, sha256, meta, expiresAt}
+
+	if s.db.Dialect == "sqlite" {
+		res, err := s.db.ExecContext(ctx, query, args...)
+		if err != nil {
+			return nil, fmt.Errorf("创建 clip_item 失败: %w", err)
+		}
+		id, err := res.LastInsertId()
+		if err != nil {
+			return nil, fmt.Errorf("获取 clip_item ID 失败: %w", err)
+		}
+		item.ID = id
+		// created_at 由 DB 默认值生成，回填以保证创建响应携带时间戳
+		if err := s.db.QueryRowContext(ctx, `SELECT created_at FROM clip_items WHERE id = `+s.ph(1), id).Scan(&item.CreatedAt); err != nil {
+			return nil, fmt.Errorf("回填 clip_item 创建时间失败: %w", err)
+		}
+		return item, nil
 	}
 
-	id, err := res.LastInsertId()
-	if err != nil {
-		return nil, fmt.Errorf("获取 clip_item ID 失败: %w", err)
+	// PostgreSQL: pgx 不支持 LastInsertId，改用 RETURNING 取回 ID 和创建时间
+	query += " RETURNING id, created_at"
+	if err := s.db.QueryRowContext(ctx, query, args...).Scan(&item.ID, &item.CreatedAt); err != nil {
+		return nil, fmt.Errorf("创建 clip_item 失败: %w", err)
 	}
-	item.ID = id
 	return item, nil
 }
 
-// GetClipItem 按 ID 查询单条（强制 user_id 隔离）
+// GetClipItem 按 ID 查询单条（强制 user_id 隔离，过期条目视为不存在）
 func (s *Store) GetClipItem(ctx context.Context, id, userID int64) (*ClipItem, error) {
 	var item ClipItem
-	var deviceID, mimeType, blobKey, textContent, sha256, expiresAt sql.NullString
+	var deviceID sql.NullInt64
+	var mimeType, blobKey, textContent, sha256, expiresAt sql.NullString
 
 	query := fmt.Sprintf(`SELECT id, user_id, device_id, type, mime_type, size, blob_key, text_content, sha256, meta, created_at, expires_at
-		FROM clip_items WHERE id = %s AND user_id = %s`, s.ph(1), s.ph(2))
+		FROM clip_items WHERE id = %s AND user_id = %s AND (expires_at IS NULL OR expires_at > %s)`,
+		s.ph(1), s.ph(2), s.now())
 
 	row := s.db.QueryRowContext(ctx, query, id, userID)
 	if err := row.Scan(
@@ -86,7 +100,7 @@ func (s *Store) GetClipItem(ctx context.Context, id, userID int64) (*ClipItem, e
 		}
 		return nil, fmt.Errorf("查询 clip_item 失败: %w", err)
 	}
-	item.DeviceID = toNullInt64(deviceID)
+	item.DeviceID = deviceID
 	item.MimeType = mimeType
 	item.BlobKey = blobKey
 	item.TextContent = textContent
@@ -95,13 +109,15 @@ func (s *Store) GetClipItem(ctx context.Context, id, userID int64) (*ClipItem, e
 	return &item, nil
 }
 
-// GetLatestClipItem 查询用户最新一条条目
+// GetLatestClipItem 查询用户最新一条条目（不含已过期）
 func (s *Store) GetLatestClipItem(ctx context.Context, userID int64) (*ClipItem, error) {
 	var item ClipItem
-	var deviceID, mimeType, blobKey, textContent, sha256, expiresAt sql.NullString
+	var deviceID sql.NullInt64
+	var mimeType, blobKey, textContent, sha256, expiresAt sql.NullString
 
 	query := fmt.Sprintf(`SELECT id, user_id, device_id, type, mime_type, size, blob_key, text_content, sha256, meta, created_at, expires_at
-		FROM clip_items WHERE user_id = %s ORDER BY id DESC LIMIT 1`, s.ph(1))
+		FROM clip_items WHERE user_id = %s AND (expires_at IS NULL OR expires_at > %s) ORDER BY id DESC LIMIT 1`,
+		s.ph(1), s.now())
 
 	row := s.db.QueryRowContext(ctx, query, userID)
 	if err := row.Scan(
@@ -113,7 +129,7 @@ func (s *Store) GetLatestClipItem(ctx context.Context, userID int64) (*ClipItem,
 		}
 		return nil, fmt.Errorf("查询最新 clip_item 失败: %w", err)
 	}
-	item.DeviceID = toNullInt64(deviceID)
+	item.DeviceID = deviceID
 	item.MimeType = mimeType
 	item.BlobKey = blobKey
 	item.TextContent = textContent
@@ -133,7 +149,8 @@ func (s *Store) ListClipItems(ctx context.Context, userID int64, beforeID int64,
 	args = append(args, userID)
 	phIdx := 1
 
-	whereClause := fmt.Sprintf("user_id = %s", s.ph(phIdx))
+	// 排除已过期条目（调度器清理前最长仍有 10 分钟窗口）
+	whereClause := fmt.Sprintf("user_id = %s AND (expires_at IS NULL OR expires_at > %s)", s.ph(phIdx), s.now())
 	phIdx++
 
 	if beforeID > 0 {
@@ -160,14 +177,15 @@ func (s *Store) ListClipItems(ctx context.Context, userID int64, beforeID int64,
 	var items []*ClipItem
 	for rows.Next() {
 		var item ClipItem
-		var deviceID, mimeType, blobKey, textContent, sha256, expiresAt sql.NullString
+		var deviceID sql.NullInt64
+		var mimeType, blobKey, textContent, sha256, expiresAt sql.NullString
 		if err := rows.Scan(
 			&item.ID, &item.UserID, &deviceID, &item.Type, &mimeType, &item.Size,
 			&blobKey, &textContent, &sha256, &item.Meta, &item.CreatedAt, &expiresAt,
 		); err != nil {
 			return nil, err
 		}
-		item.DeviceID = toNullInt64(deviceID)
+		item.DeviceID = deviceID
 		item.MimeType = mimeType
 		item.BlobKey = blobKey
 		item.TextContent = textContent
@@ -213,8 +231,8 @@ func (s *Store) ListClipItemsSince(ctx context.Context, userID, sinceID int64, l
 	}
 
 	query := fmt.Sprintf(`SELECT id, user_id, device_id, type, mime_type, size, blob_key, text_content, sha256, meta, created_at, expires_at
-		FROM clip_items WHERE user_id = %s AND id > %s ORDER BY id ASC LIMIT %s`,
-		s.ph(1), s.ph(2), s.ph(3))
+		FROM clip_items WHERE user_id = %s AND id > %s AND (expires_at IS NULL OR expires_at > %s) ORDER BY id ASC LIMIT %s`,
+		s.ph(1), s.ph(2), s.now(), s.ph(3))
 
 	rows, err := s.db.QueryContext(ctx, query, userID, sinceID, limit)
 	if err != nil {
@@ -225,14 +243,15 @@ func (s *Store) ListClipItemsSince(ctx context.Context, userID, sinceID int64, l
 	var items []*ClipItem
 	for rows.Next() {
 		var item ClipItem
-		var deviceID, mimeType, blobKey, textContent, sha256, expiresAt sql.NullString
+		var deviceID sql.NullInt64
+		var mimeType, blobKey, textContent, sha256, expiresAt sql.NullString
 		if err := rows.Scan(
 			&item.ID, &item.UserID, &deviceID, &item.Type, &mimeType, &item.Size,
 			&blobKey, &textContent, &sha256, &item.Meta, &item.CreatedAt, &expiresAt,
 		); err != nil {
 			return nil, err
 		}
-		item.DeviceID = toNullInt64(deviceID)
+		item.DeviceID = deviceID
 		item.MimeType = mimeType
 		item.BlobKey = blobKey
 		item.TextContent = textContent
@@ -241,17 +260,4 @@ func (s *Store) ListClipItemsSince(ctx context.Context, userID, sinceID int64, l
 		items = append(items, &item)
 	}
 	return items, rows.Err()
-}
-
-// toNullInt64 将 NullString（包含整数字符串）转为 NullInt64
-// device_id 在 SQLite 中以 TEXT 存储时需要转换
-func toNullInt64(ns sql.NullString) sql.NullInt64 {
-	if !ns.Valid {
-		return sql.NullInt64{}
-	}
-	var n int64
-	if _, err := fmt.Sscanf(ns.String, "%d", &n); err != nil {
-		return sql.NullInt64{}
-	}
-	return sql.NullInt64{Int64: n, Valid: true}
 }

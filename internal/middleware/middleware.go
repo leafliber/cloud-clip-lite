@@ -82,6 +82,9 @@ func CORS(allowedOrigins []string) func(http.Handler) http.Handler {
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// 所有响应恒设 Vary: Origin，避免共享缓存把带 ACAO 的响应错发给其他源
+			w.Header().Set("Vary", "Origin")
+
 			origin := r.Header.Get("Origin")
 			if origin == "" {
 				origin = "*"
@@ -89,7 +92,6 @@ func CORS(allowedOrigins []string) func(http.Handler) http.Handler {
 
 			if allowAll || originsSet[origin] {
 				w.Header().Set("Access-Control-Allow-Origin", origin)
-				w.Header().Set("Vary", "Origin")
 			}
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
 			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-API-Token, X-Requested-With")

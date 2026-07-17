@@ -29,15 +29,31 @@ func (s *Store) CreateDevice(ctx context.Context, d *Device) (*Device, error) {
 	query := fmt.Sprintf(`INSERT INTO devices (user_id, name, type, api_token_hash)
 		VALUES (%s, %s, %s, %s)`,
 		s.ph(1), s.ph(2), s.ph(3), s.ph(4))
-	res, err := s.db.ExecContext(ctx, query, d.UserID, d.Name, d.Type, tokenHash)
-	if err != nil {
+
+	args := []any{d.UserID, d.Name, d.Type, tokenHash}
+
+	if s.db.Dialect == "sqlite" {
+		res, err := s.db.ExecContext(ctx, query, args...)
+		if err != nil {
+			return nil, fmt.Errorf("创建设备失败: %w", err)
+		}
+		id, err := res.LastInsertId()
+		if err != nil {
+			return nil, fmt.Errorf("获取设备 ID 失败: %w", err)
+		}
+		d.ID = id
+		// created_at 由 DB 默认值生成，回填以保证创建响应携带时间戳
+		if err := s.db.QueryRowContext(ctx, `SELECT created_at FROM devices WHERE id = `+s.ph(1), id).Scan(&d.CreatedAt); err != nil {
+			return nil, fmt.Errorf("回填设备创建时间失败: %w", err)
+		}
+		return d, nil
+	}
+
+	// PostgreSQL: pgx 不支持 LastInsertId，改用 RETURNING 取回 ID 和创建时间
+	query += " RETURNING id, created_at"
+	if err := s.db.QueryRowContext(ctx, query, args...).Scan(&d.ID, &d.CreatedAt); err != nil {
 		return nil, fmt.Errorf("创建设备失败: %w", err)
 	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return nil, fmt.Errorf("获取设备 ID 失败: %w", err)
-	}
-	d.ID = id
 	return d, nil
 }
 

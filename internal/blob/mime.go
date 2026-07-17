@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"io"
 	"net/http"
+	"strings"
 )
 
 // 常见文件类型的 magic bytes
+// 注意：RIFF 容器（WEBP/WAVE/AVI）不在此表，由 DetectMIME 单独按格式标签区分
 var magicSignatures = []struct {
 	mimeType string
 	signature []byte
@@ -15,7 +17,6 @@ var magicSignatures = []struct {
 	{"image/png", []byte{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}, 0},
 	{"image/jpeg", []byte{0xFF, 0xD8, 0xFF}, 0},
 	{"image/gif", []byte{0x47, 0x49, 0x46, 0x38}, 0},
-	{"image/webp", []byte{0x52, 0x49, 0x46, 0x46}, 0}, // RIFF (WebP container)
 	{"image/bmp", []byte{0x42, 0x4D}, 0},
 	{"image/svg+xml", []byte("<svg"), 0},
 	{"application/pdf", []byte{0x25, 0x50, 0x44, 0x46}, 0}, // %PDF
@@ -23,7 +24,6 @@ var magicSignatures = []struct {
 	{"application/x-gzip", []byte{0x1F, 0x8B}, 0},
 	{"application/x-tar", []byte{0x75, 0x73, 0x74, 0x61, 0x72}, 257},
 	{"audio/mpeg", []byte{0x49, 0x44, 0x33}, 0}, // ID3
-	{"audio/wav", []byte{0x52, 0x49, 0x46, 0x46}, 0}, // RIFF
 	{"video/mp4", []byte{0x66, 0x74, 0x79, 0x70}, 4}, // ftyp at offset 4
 }
 
@@ -48,6 +48,17 @@ var allowedMIMETypes = map[string]bool{
 
 // DetectMIME 从文件内容头部检测真实 MIME 类型
 func DetectMIME(header []byte) string {
+	// RIFF 容器需看 offset 8-12 的格式标签区分 WEBP/WAVE 等
+	if len(header) >= 12 && bytes.Equal(header[:4], []byte("RIFF")) {
+		switch string(header[8:12]) {
+		case "WEBP":
+			return "image/webp"
+		case "WAVE":
+			return "audio/wav"
+		}
+		return "application/octet-stream"
+	}
+
 	for _, sig := range magicSignatures {
 		if len(header) >= sig.offset+len(sig.signature) {
 			if bytes.Equal(header[sig.offset:sig.offset+len(sig.signature)], sig.signature) {
@@ -68,20 +79,18 @@ func IsMIMEAllowed(mimeType string) bool {
 func ValidateMIME(declaredMIME string, header []byte) (detectedMIME string, ok bool) {
 	detected := DetectMIME(header)
 
-	// SVG 和纯文本难以通过 magic bytes 区分，信任声明
+	// SVG 和纯文本难以通过 magic bytes 区分，需结合二次嗅探判断
 	if detected == "application/octet-stream" {
+		// 无魔数内容用 net/http 二次嗅探，拦截伪装成合法类型的 HTML 等危险内容
+		sniffed := http.DetectContentType(header)
+		if i := strings.IndexByte(sniffed, ';'); i >= 0 {
+			sniffed = strings.TrimSpace(sniffed[:i])
+		}
+		if sniffed == "text/html" {
+			return sniffed, false
+		}
+		// 纯文本/未知二进制：信任声明
 		return declaredMIME, true
-	}
-
-	// RIFF 容器可能是 WebP 或 WAV，进一步检查
-	if detected == "image/webp" && declaredMIME == "audio/wav" {
-		// 都是 RIFF 开头，检查具体格式
-		if len(header) >= 12 && string(header[8:12]) == "WAVE" {
-			return "audio/wav", true
-		}
-		if len(header) >= 12 && string(header[8:12]) == "WEBP" {
-			return "image/webp", declaredMIME == "image/webp"
-		}
 	}
 
 	return detected, detected == declaredMIME
@@ -106,6 +115,7 @@ func MIMEByExtension(filename string) string {
 			break
 		}
 	}
+	ext = strings.ToLower(ext)
 	switch ext {
 	case ".txt":
 		return "text/plain"

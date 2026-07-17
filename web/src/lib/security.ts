@@ -34,11 +34,22 @@ export function formatBytes(bytes: number): string {
 }
 
 /**
+ * 解析后端返回的时间字符串。
+ * 后端 SQLite datetime('now') 返回无时区的 UTC 字符串（如 "2026-07-17 01:08:50"），
+ * 直接 new Date() 会被浏览器按本地时区解析，导致显示偏差（如 UTC+8 下差 8 小时）；
+ * 此处归一化为带 UTC 后缀的 ISO 格式再解析。
+ */
+function parseServerTime(iso: string): Date {
+  const normalized = iso.includes('T') ? iso : iso.replace(' ', 'T') + 'Z';
+  return new Date(normalized);
+}
+
+/**
  * 将 ISO 时间字符串格式化为 "YYYY-MM-DD HH:mm:ss"。
  */
 export function formatTime(iso: string): string {
   if (!iso) return '';
-  const d = new Date(iso);
+  const d = parseServerTime(iso);
   if (isNaN(d.getTime())) return iso;
   const pad = (n: number) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
@@ -49,7 +60,7 @@ export function formatTime(iso: string): string {
  */
 export function timeAgo(iso: string): string {
   if (!iso) return '';
-  const d = new Date(iso);
+  const d = parseServerTime(iso);
   if (isNaN(d.getTime())) return '';
   const diff = Math.max(0, Date.now() - d.getTime());
   const sec = Math.floor(diff / 1000);

@@ -147,6 +147,26 @@ func (c *Config) Validate() error {
 	if c.DefaultRetentionDays <= 0 {
 		return fmt.Errorf("DEFAULT_RETENTION_DAYS 必须 > 0")
 	}
+	if c.AccessTTL <= 0 {
+		return fmt.Errorf("ACCESS_TTL 必须 > 0")
+	}
+	if c.RefreshTTL <= 0 {
+		return fmt.Errorf("REFRESH_TTL 必须 > 0")
+	}
+	// argon2.Key 对非法参数直接 panic，需在配置阶段拦截
+	if c.Argon2Iterations < 1 {
+		return fmt.Errorf("ARGON2_ITERATIONS 必须 ≥ 1，为 0 会导致 argon2 计算 panic")
+	}
+	if c.Argon2Parallelism < 1 {
+		return fmt.Errorf("ARGON2_PARALLELISM 必须在 1..255 之间（0 或 >255 被截断为 0 会导致 argon2 计算 panic）")
+	}
+	// 单位 KiB：下限 8MiB（argon2 安全基线），上限 4GiB（防止误配导致单次哈希 OOM）
+	if c.Argon2Memory < 8*1024 || c.Argon2Memory > 4*1024*1024 {
+		return fmt.Errorf("ARGON2_MEMORY 必须在 8192..4194304 KiB（8MiB..4GiB）之间，当前: %d", c.Argon2Memory)
+	}
+	if c.RateLimitPerMinute <= 0 {
+		return fmt.Errorf("RATE_LIMIT_PER_MINUTE 必须 > 0")
+	}
 	return nil
 }
 

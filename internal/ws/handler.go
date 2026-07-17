@@ -2,10 +2,12 @@ package ws
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -134,10 +136,48 @@ func (h *Handler) authenticate(ctx context.Context, token string) (userID int64,
 		return 0, "", 0, apiErr
 	}
 
-	// 异步更新设备最后活跃时间
-	go h.store.UpdateDeviceLastSeen(context.Background(), dev.ID)
+	// 异步更新设备最后活跃时间：带超时与错误日志，避免 goroutine 泄漏
+	// 或优雅关闭后静默失败；last_seen_at 距今不足 1 分钟则跳过，降低重连风暴写压力
+	if !lastSeenRecent(dev.LastSeenAt) {
+		go func(deviceID int64) {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if err := h.store.UpdateDeviceLastSeen(ctx, deviceID); err != nil {
+				h.logger.Error("更新设备最后活跃时间失败", "error", err, "device_id", deviceID)
+			}
+		}(dev.ID)
+	}
 
 	return user.ID, user.Username, dev.ID, nil
+}
+
+// lastSeenRecent 判断设备的 last_seen_at 是否距今不足 1 分钟
+// 解析失败（含 NULL）时按不新鲜处理，照常触发更新
+func lastSeenRecent(lastSeen sql.NullString) bool {
+	if !lastSeen.Valid {
+		return false
+	}
+	t, ok := parseDBTime(lastSeen.String)
+	if !ok {
+		return false
+	}
+	return time.Since(t) < time.Minute
+}
+
+// parseDBTime 解析数据库存储的时间字符串
+// 兼容 SQLite datetime('now')（UTC，无时区）与 PostgreSQL TIMESTAMPTZ（RFC3339Nano）
+func parseDBTime(s string) (time.Time, bool) {
+	layouts := []string{
+		time.RFC3339Nano,
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05",
+	}
+	for _, layout := range layouts {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
 }
 
 // syncClipItems 增量同步：查询 sinceID 之后的新条目

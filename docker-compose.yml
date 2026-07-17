@@ -35,11 +35,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/healthz"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
+    # 注意：最终镜像为 distroless（无 shell/wget），无法使用容器内健康检查命令，
+    # 如需健康检查请在编排层或外部探针中探测 /healthz。
 
   # ---- PostgreSQL ----
   db:

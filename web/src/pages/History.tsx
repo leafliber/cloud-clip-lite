@@ -1,4 +1,4 @@
-﻿import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Navigate } from 'react-router-dom';
 import { useAuth } from '@/lib/auth';
 import { wsClient } from '@/lib/ws';
@@ -36,23 +36,15 @@ const TYPE_TABS: { key: TypeFilter; label: string }[] = [
   { key: 'file', label: '文件' },
 ];
 
-/** 取当前访问令牌（用于二进制内容鉴权） */
+/** 取当前访问令牌（用于 WS 鉴权） */
 function authToken(): string {
   return tokenStorage.getAccessToken() ?? '';
 }
 
-function authHeaders(): HeadersInit {
-  const token = authToken();
-  return token ? { Authorization: `Bearer ${token}` } : {};
-}
-
-/** 下载条目内容：带鉴权拉取 blob 后触发下载 */
+/** 下载条目内容：带鉴权拉取 blob（内置 401 刷新重试）后触发下载 */
 async function downloadClipContent(id: number, filename: string): Promise<void> {
-  const res = await fetch(`/api/clip/${id}/content`, { headers: authHeaders() });
-  if (!res.ok) throw new Error('下载失败');
-  const blob = await res.blob();
-  const url = URL.createObjectURL(blob);
-  downloadBlob(url, filename);
+  const blob = await api.getBlob(`/api/clip/${id}/content`);
+  downloadBlob(blob, filename);
 }
 
 /** 类型 → Badge 变体 */
@@ -65,7 +57,7 @@ function typeLabel(type: ClipItem['type']): string {
   return type === 'text' ? '文本' : type === 'image' ? '图片' : '文件';
 }
 
-/** 图片缩略图：带鉴权拉取 blob 并生成 objectURL，卸载时回收 */
+/** 图片缩略图：带鉴权拉取 blob 并生成 objectURL（内置 401 刷新重试），卸载时回收，失败可点击重试 */
 function ClipImage({
   id,
   onClick,
@@ -77,6 +69,7 @@ function ClipImage({
 }) {
   const [url, setUrl] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
+  const [retry, setRetry] = useState(0);
 
   useEffect(() => {
     let revoked = false;
@@ -84,8 +77,7 @@ function ClipImage({
     setUrl(null);
     setFailed(false);
 
-    fetch(`/api/clip/${id}/content`, { headers: authHeaders() })
-      .then((res) => (res.ok ? res.blob() : Promise.reject(new Error('fetch failed'))))
+    api.getBlob(`/api/clip/${id}/content`)
       .then((blob) => {
         if (revoked) return;
         objectUrl = URL.createObjectURL(blob);
@@ -99,12 +91,27 @@ function ClipImage({
       revoked = true;
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [id]);
+  }, [id, retry]);
 
   if (failed) {
     return (
-      <div className={cn('flex items-center justify-center text-xs text-[var(--text-muted)]', className)}>
-        <span>图片加载失败</span>
+      <div
+        role="button"
+        tabIndex={0}
+        onClick={(e) => {
+          e.stopPropagation();
+          setRetry((n) => n + 1);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.stopPropagation();
+            setRetry((n) => n + 1);
+          }
+        }}
+        className={cn('flex cursor-pointer items-center justify-center text-xs text-[var(--text-muted)] hover:text-[var(--text-secondary)]', className)}
+        title="点击重试"
+      >
+        <span>图片加载失败，点击重试</span>
       </div>
     );
   }
@@ -344,10 +351,13 @@ export default function History() {
   itemsRef.current = items;
   const typeRef = useRef<TypeFilter>(type);
   typeRef.current = type;
+  // 列表请求序号：只接受最新一次请求的结果，防止快速切换过滤时慢响应覆盖新列表
+  const listReqSeq = useRef(0);
 
   /** 拉取首页（类型变化时重置） */
   const fetchFirst = useCallback(
     async (filter: TypeFilter) => {
+      const seq = ++listReqSeq.current;
       setLoadingFirst(true);
       setItems([]);
       setCursor(null);
@@ -357,14 +367,16 @@ export default function History() {
           limit: PAGE_SIZE,
           ...(filter !== 'all' ? { type: filter } : {}),
         });
+        if (seq !== listReqSeq.current) return; // 已有更新的请求，丢弃本次结果
         const list = res.items ?? [];
         setItems(list);
         setCursor(res.cursor ?? null);
         setHasMore(list.length >= PAGE_SIZE);
       } catch (err) {
+        if (seq !== listReqSeq.current) return;
         toast.error(err instanceof Error ? err.message : '加载历史失败');
       } finally {
-        setLoadingFirst(false);
+        if (seq === listReqSeq.current) setLoadingFirst(false);
       }
     },
     [toast],
@@ -373,6 +385,8 @@ export default function History() {
   /** 加载更多（游标分页） */
   const fetchMore = useCallback(async () => {
     if (!cursor || !hasMore || loadingMore) return;
+    // 绑定发起时的请求序号：若在飞期间切换了过滤条件（fetchFirst 递增序号），丢弃本次结果
+    const seq = listReqSeq.current;
     setLoadingMore(true);
     try {
       const res = await api.get<ClipListResponse>('/api/clip', {
@@ -380,11 +394,13 @@ export default function History() {
         before: cursor,
         ...(type !== 'all' ? { type } : {}),
       });
+      if (seq !== listReqSeq.current) return;
       const list = res.items ?? [];
       setItems((prev) => [...prev, ...list]);
       setCursor(res.cursor ?? null);
       setHasMore(list.length >= PAGE_SIZE);
     } catch (err) {
+      if (seq !== listReqSeq.current) return;
       toast.error(err instanceof Error ? err.message : '加载更多失败');
     } finally {
       setLoadingMore(false);
@@ -400,8 +416,10 @@ export default function History() {
   // WS 连接：实时同步新增/删除
   useEffect(() => {
     if (!user) return;
+    let cancelled = false;
 
     wsClient.onClipCreated = (item: ClipItem) => {
+      if (cancelled) return;
       // 仅当符合当前类型过滤时插入顶部（去重）
       const filter = typeRef.current;
       if (filter !== 'all' && item.type !== filter) return;
@@ -411,13 +429,18 @@ export default function History() {
       });
     };
     wsClient.onClipDeleted = (id: number) => {
+      if (cancelled) return;
       setItems((prev) => prev.filter((it) => it.id !== id));
+      // 正在预览的条目被其他设备删除时，同步关闭预览弹窗
+      setPreviewItem((prev) => (prev && prev.id === id ? null : prev));
     };
     wsClient.onConnected = () => {
+      if (cancelled) return;
       const maxId = itemsRef.current.reduce((m, it) => Math.max(m, it.id), 0);
       wsClient.sync(maxId);
     };
     wsClient.onSyncResult = (result) => {
+      if (cancelled) return;
       const filter = typeRef.current;
       setItems((prev) => {
         const existing = new Set(prev.map((it) => it.id));
@@ -433,6 +456,7 @@ export default function History() {
     wsClient.connect(authToken());
 
     return () => {
+      cancelled = true;
       wsClient.disconnect();
       wsClient.onClipCreated = () => {};
       wsClient.onClipDeleted = () => {};
@@ -455,9 +479,7 @@ export default function History() {
   const handleCopyBlob = async (item: ClipItem) => {
     setCopyingId(item.id);
     try {
-      const res = await fetch(`/api/clip/${item.id}/content`, { headers: authHeaders() });
-      if (!res.ok) throw new Error('获取内容失败');
-      const blob = await res.blob();
+      const blob = await api.getBlob(`/api/clip/${item.id}/content`);
       const ok = await copyBlobToClipboard(blob);
       if (ok) {
         toast.success(item.type === 'image' ? '图片已复制到剪切板' : '文件已复制到剪切板');

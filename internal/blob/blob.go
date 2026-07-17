@@ -3,6 +3,7 @@ package blob
 import (
 	"context"
 	"io"
+	"time"
 )
 
 // BlobStore 对象存储抽象接口
@@ -22,6 +23,12 @@ type BlobStore interface {
 
 	// List 列出所有 blob 的 key（用于孤儿回收）
 	List(ctx context.Context) ([]string, error)
+
+	// ModTime 返回 blob 的修改时间（孤儿回收宽限期判断）
+	ModTime(ctx context.Context, blobKey string) (time.Time, error)
+
+	// CleanStaleTmpFiles 清理超过 maxAge 的残留 .tmp 临时文件，返回删除数量
+	CleanStaleTmpFiles(ctx context.Context, maxAge time.Duration) (int, error)
 }
 
 // GenerateBlobKey 生成 blob 存储键

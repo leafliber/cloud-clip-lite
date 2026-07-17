@@ -304,3 +304,70 @@ func TestStore_ListInviteCodes(t *testing.T) {
 		t.Errorf("返回 %d 个邀请码, 期望 3", len(codes))
 	}
 }
+
+// TestStore_UseInviteCode_DoubleSpend 回归：一次性邀请码不可双花。
+// UPDATE 带 used 未使用守卫，第二个使用者应命中 0 行返回 ErrNotFound。
+func TestStore_UseInviteCode_DoubleSpend(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	admin, _ := s.CreateUser(ctx, &User{Username: "admin-once", PasswordHash: "h", Role: "admin"})
+	if _, err := s.CreateInviteCode(ctx, "ONCEONLY", admin.ID, nil); err != nil {
+		t.Fatalf("CreateInviteCode 失败: %v", err)
+	}
+
+	u1, _ := s.CreateUser(ctx, &User{Username: "first-user", PasswordHash: "h"})
+	u2, _ := s.CreateUser(ctx, &User{Username: "second-user", PasswordHash: "h"})
+
+	// 第一次使用成功
+	if err := s.UseInviteCode(ctx, "ONCEONLY", u1.ID); err != nil {
+		t.Fatalf("第一次 UseInviteCode 失败: %v", err)
+	}
+
+	// 第二次使用应返回 ErrNotFound（守卫命中 0 行）
+	if err := s.UseInviteCode(ctx, "ONCEONLY", u2.ID); err != ErrNotFound {
+		t.Errorf("重复使用邀请码应返回 ErrNotFound, 实际 %v", err)
+	}
+}
+
+func TestStore_UpdateUserEmail(t *testing.T) {
+	s := newTestStore(t)
+	ctx := context.Background()
+
+	u1, _ := s.CreateUser(ctx, &User{Username: "emailuser1", PasswordHash: "h"})
+	u2, _ := s.CreateUser(ctx, &User{Username: "emailuser2", PasswordHash: "h",
+		Email: sql.NullString{String: "taken@example.com", Valid: true}})
+
+	// 设置邮箱
+	if err := s.UpdateUserEmail(ctx, u1.ID, "new@example.com"); err != nil {
+		t.Fatalf("UpdateUserEmail 失败: %v", err)
+	}
+	updated, _ := s.GetUserByID(ctx, u1.ID)
+	if !updated.Email.Valid || updated.Email.String != "new@example.com" {
+		t.Errorf("email = %v, 期望 new@example.com", updated.Email)
+	}
+
+	// 唯一约束冲突应返回 ErrEmailExists
+	if err := s.UpdateUserEmail(ctx, u1.ID, "taken@example.com"); err != ErrEmailExists {
+		t.Errorf("期望 ErrEmailExists, 实际 %v", err)
+	}
+
+	// 空串清除为 NULL
+	if err := s.UpdateUserEmail(ctx, u1.ID, ""); err != nil {
+		t.Fatalf("清除邮箱失败: %v", err)
+	}
+	updated, _ = s.GetUserByID(ctx, u1.ID)
+	if updated.Email.Valid {
+		t.Errorf("email 应已清除为 NULL, 实际 %v", updated.Email)
+	}
+
+	// 两个用户可同时为 NULL（不触发唯一约束）
+	if err := s.UpdateUserEmail(ctx, u2.ID, ""); err != nil {
+		t.Errorf("清除邮箱不应报错: %v", err)
+	}
+
+	// 不存在的用户返回 ErrNotFound
+	if err := s.UpdateUserEmail(ctx, 99999, "x@example.com"); err != ErrNotFound {
+		t.Errorf("期望 ErrNotFound, 实际 %v", err)
+	}
+}

@@ -428,7 +428,8 @@ func TestClip_Delete_NotFound(t *testing.T) {
 }
 
 func TestClip_Delete_File_CleansBlob(t *testing.T) {
-	handler, st := apiTestSetup(t, "open")
+	handler, st, bs := apiTestSetupWithBlob(t, "open")
+	ctx := context.Background()
 	token := loginAndGetToken(t, handler, st, "delblob", "password123")
 
 	content := []byte("blob to delete")
@@ -436,10 +437,21 @@ func TestClip_Delete_File_CleansBlob(t *testing.T) {
 	createResp := parseJSON(t, rec)
 	itemID := int64(createResp["id"].(float64))
 
-	// 确认能下载
-	rec = doRequest(handler, "GET", fmt.Sprintf("/api/clip/%d/content", itemID), nil, token)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("删除前应能下载, 状态码 = %d", rec.Code)
+	// 拿到 blob_key 并确认文件已落盘
+	u, err := st.GetUserByUsername(ctx, "delblob")
+	if err != nil {
+		t.Fatalf("查询用户失败: %v", err)
+	}
+	item, err := st.GetClipItem(ctx, itemID, u.ID)
+	if err != nil {
+		t.Fatalf("查询条目失败: %v", err)
+	}
+	if !item.BlobKey.Valid {
+		t.Fatal("条目应包含 blob_key")
+	}
+	exists, err := bs.Exists(ctx, item.BlobKey.String)
+	if err != nil || !exists {
+		t.Fatalf("删除前 blob 应存在, exists=%v, err=%v", exists, err)
 	}
 
 	// 删除
@@ -448,13 +460,56 @@ func TestClip_Delete_File_CleansBlob(t *testing.T) {
 		t.Fatalf("删除失败: %d", rec.Code)
 	}
 
-	// 等待异步 blob 清理
-	time.Sleep(100 * time.Millisecond)
+	// blob 文件应被同步清理（无需 sleep 等待异步任务）
+	exists, err = bs.Exists(ctx, item.BlobKey.String)
+	if err != nil {
+		t.Fatalf("检查 blob 失败: %v", err)
+	}
+	if exists {
+		t.Error("删除后 blob 文件应被清理")
+	}
 
 	// 删除后下载应 404
 	rec = doRequest(handler, "GET", fmt.Sprintf("/api/clip/%d/content", itemID), nil, token)
 	if rec.Code != http.StatusNotFound {
 		t.Errorf("删除后下载应 404, 实际 %d", rec.Code)
+	}
+}
+
+func TestClip_CreateText_InvalidExpiresIn(t *testing.T) {
+	handler, st := apiTestSetup(t, "open")
+	token := loginAndGetToken(t, handler, st, "expireuser", "password123")
+
+	tests := []struct {
+		name      string
+		expiresIn int
+	}{
+		{"零值", 0},
+		{"负数", -100},
+		{"超过 3650 天上限", 315360001},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rec := doRequest(handler, "POST", "/api/clip", createTextRequest{
+				Type:      "text",
+				Text:      "hello",
+				ExpiresIn: &tt.expiresIn,
+			}, token)
+			if rec.Code != http.StatusBadRequest {
+				t.Errorf("expires_in=%d: 状态码 = %d, 期望 400", tt.expiresIn, rec.Code)
+			}
+		})
+	}
+
+	// 合法值应正常创建
+	valid := 3600
+	rec := doRequest(handler, "POST", "/api/clip", createTextRequest{
+		Type:      "text",
+		Text:      "hello",
+		ExpiresIn: &valid,
+	}, token)
+	if rec.Code != http.StatusCreated {
+		t.Errorf("合法 expires_in 应 201, 实际 %d", rec.Code)
 	}
 }
 

@@ -34,6 +34,7 @@ export interface SyncResult {
 const HEARTBEAT_INTERVAL = 30_000; // 30s
 const MAX_RECONNECT_DELAY = 30_000; // 上限 30s
 const RECONNECT_BASE = 1_000; // 起始 1s
+const SYNC_LIMIT = 100; // 服务端单次 sync 返回上限（与后端 ws syncLimit 一致）
 
 class WSClient {
   private ws: WebSocket | null = null;
@@ -98,11 +99,11 @@ class WSClient {
   // ---------- 内部实现 ----------
 
   private open(): void {
-    if (!this.token) {
-      const stored = tokenStorage.getAccessToken();
-      if (!stored) return;
-      this.token = stored;
-    }
+    // 每次（重）连都现读最新 token：HTTP 侧静默刷新后 localStorage 才是最新值，
+    // 沿用旧 token 会导致重连握手 401 → 指数退避无限重试
+    const token = tokenStorage.getAccessToken();
+    if (!token) return;
+    this.token = token;
 
     // token 通过查询参数传递（浏览器 WS 无法设置自定义头）
     const url = `${this.url}?token=${encodeURIComponent(this.token)}`;
@@ -171,11 +172,18 @@ class WSClient {
 
       case 'sync.result': {
         const data = msg.data || {};
+        const items: ClipItem[] = Array.isArray(data.items) ? data.items : [];
         this.onSyncResult?.({
           since: data.since ?? 0,
-          items: Array.isArray(data.items) ? data.items : [],
+          items,
           count: typeof data.count === 'number' ? data.count : 0,
         });
+        // 服务端单次 sync 最多返回 SYNC_LIMIT 条最旧条目：满额说明 since 之后可能还有
+        // 遗漏，用本批最大 id 作为新 since 继续拉取，直到不足上限为止
+        if (items.length >= SYNC_LIMIT) {
+          const maxId = items.reduce((m, it) => Math.max(m, it?.id ?? 0), 0);
+          if (maxId > 0) this.sync(maxId);
+        }
         break;
       }
 

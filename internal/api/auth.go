@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -23,6 +24,9 @@ type AuthHandler struct {
 	jwtMgr  *auth.JWTManager
 	hasher  *auth.PasswordHasher
 	logger  *slog.Logger
+	// dummy 哈希用于登录时用户不存在的兜底校验，惰性生成一次
+	dummyOnce sync.Once
+	dummyHash string
 }
 
 // NewAuthHandler 创建认证处理器
@@ -79,20 +83,11 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "INVALID_INVITE_CODE", "邀请码无效或已使用")
 			return
 		}
-		// 检查过期
-		if ic.ExpiresAt.Valid {
-			expiresAt, err := time.Parse("2006-01-02 15:04:05", ic.ExpiresAt.String)
-			if err == nil && time.Now().After(expiresAt) {
-				writeError(w, http.StatusBadRequest, "INVITE_CODE_EXPIRED", "邀请码已过期")
-				return
-			}
+		// 检查过期（isExpired 解析失败按已过期处理，fail-closed）
+		if ic.ExpiresAt.Valid && isExpired(ic.ExpiresAt.String) {
+			writeError(w, http.StatusBadRequest, "INVITE_CODE_EXPIRED", "邀请码已过期")
+			return
 		}
-		// 延迟标记使用（用户创建成功后）
-		defer func() {
-			if err == nil {
-				h.store.UseInviteCode(r.Context(), req.InviteCode, 0) // userID 在下面设置
-			}
-		}()
 	case "open":
 		// 开放注册，无需校验
 	default:
@@ -128,14 +123,32 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 邀请码模式下标记已使用
+	// 邀请码模式下在用户创建成功后一次性标记已使用（带 used=0 原子守卫）
 	if h.cfg.AllowRegister == "invite" && req.InviteCode != "" {
-		_ = h.store.UseInviteCode(r.Context(), req.InviteCode, created.ID)
+		if err := h.store.UseInviteCode(r.Context(), req.InviteCode, created.ID); err != nil {
+			// 并发双花：邀请码被其他注册请求抢先使用，兜底删除已创建用户（best effort）
+			h.logger.Error("标记邀请码使用失败，回滚新建用户", "error", err, "user_id", created.ID)
+			if derr := h.store.DeleteUser(r.Context(), created.ID); derr != nil {
+				h.logger.Error("回滚删除用户失败", "error", derr, "user_id", created.ID)
+			}
+			writeError(w, http.StatusBadRequest, "INVALID_INVITE_CODE", "邀请码无效或已使用")
+			return
+		}
 	}
 
 	// 生成 Token
-	accessToken, _ := h.jwtMgr.GenerateAccessToken(created.ID, created.Username, created.Role)
-	refreshToken, _ := h.generateAndStoreRefreshToken(r.Context(), created.ID)
+	accessToken, err := h.jwtMgr.GenerateAccessToken(created.ID, created.Username, created.Role)
+	if err != nil {
+		h.logger.Error("生成 Access Token 失败", "error", err, "user_id", created.ID)
+		writeError(w, http.StatusInternalServerError, "TOKEN_FAILED", "令牌生成失败")
+		return
+	}
+	refreshToken, err := h.generateAndStoreRefreshToken(r.Context(), created.ID)
+	if err != nil {
+		h.logger.Error("生成 Refresh Token 失败", "error", err, "user_id", created.ID)
+		writeError(w, http.StatusInternalServerError, "TOKEN_FAILED", "令牌生成失败")
+		return
+	}
 
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"user":          h.userResponse(created),
@@ -168,6 +181,8 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	user, err := h.store.GetUserByUsername(r.Context(), req.Username)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
+			// 用户不存在时也执行一次完整 Verify，抹平响应时间差，防止用户名枚举
+			_, _ = h.hasher.Verify(req.Password, h.dummyVerifyHash())
 			writeError(w, http.StatusUnauthorized, "INVALID_CREDENTIALS", "用户名或密码错误")
 			return
 		}
@@ -190,8 +205,18 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 生成 Token
-	accessToken, _ := h.jwtMgr.GenerateAccessToken(user.ID, user.Username, user.Role)
-	refreshToken, _ := h.generateAndStoreRefreshToken(r.Context(), user.ID)
+	accessToken, err := h.jwtMgr.GenerateAccessToken(user.ID, user.Username, user.Role)
+	if err != nil {
+		h.logger.Error("生成 Access Token 失败", "error", err, "user_id", user.ID)
+		writeError(w, http.StatusInternalServerError, "TOKEN_FAILED", "令牌生成失败")
+		return
+	}
+	refreshToken, err := h.generateAndStoreRefreshToken(r.Context(), user.ID)
+	if err != nil {
+		h.logger.Error("生成 Refresh Token 失败", "error", err, "user_id", user.ID)
+		writeError(w, http.StatusInternalServerError, "TOKEN_FAILED", "令牌生成失败")
+		return
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"user":          h.userResponse(user),
@@ -242,14 +267,31 @@ func (h *AuthHandler) Refresh(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if user.Status != "active" {
-		writeError(w, http.StatusForbidden, "ACCOUNT_DISABLED", "账号已被禁用")
+		// 被禁用用户吊销 refresh token，禁止在有效期内无限续期
+		if err := h.store.RevokeRefreshToken(r.Context(), tokenHash); err != nil {
+			h.logger.Error("吊销禁用用户的 Refresh Token 失败", "error", err, "user_id", user.ID)
+		}
+		writeError(w, http.StatusUnauthorized, "ACCOUNT_DISABLED", "账号已被禁用")
 		return
 	}
 
-	// 吊销旧 Token，签发新的（轮转）
-	_ = h.store.RevokeRefreshToken(r.Context(), tokenHash)
-	accessToken, _ := h.jwtMgr.GenerateAccessToken(user.ID, user.Username, user.Role)
-	newRefreshToken, _ := h.generateAndStoreRefreshToken(r.Context(), user.ID)
+	// 轮转：先生成新 Token 成功后再吊销旧的，避免生成失败导致用户静默掉线
+	accessToken, err := h.jwtMgr.GenerateAccessToken(user.ID, user.Username, user.Role)
+	if err != nil {
+		h.logger.Error("生成 Access Token 失败", "error", err, "user_id", user.ID)
+		writeError(w, http.StatusInternalServerError, "TOKEN_FAILED", "令牌生成失败")
+		return
+	}
+	newRefreshToken, err := h.generateAndStoreRefreshToken(r.Context(), user.ID)
+	if err != nil {
+		h.logger.Error("生成 Refresh Token 失败", "error", err, "user_id", user.ID)
+		writeError(w, http.StatusInternalServerError, "TOKEN_FAILED", "令牌生成失败")
+		return
+	}
+	// 吊销旧 Token（失败仅记日志，不影响新 Token 使用）
+	if err := h.store.RevokeRefreshToken(r.Context(), tokenHash); err != nil {
+		h.logger.Error("吊销旧 Refresh Token 失败", "error", err, "user_id", user.ID)
+	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"access_token":  accessToken,
@@ -283,7 +325,8 @@ func (h *AuthHandler) generateAndStoreRefreshToken(ctx context.Context, userID i
 		return "", err
 	}
 	tokenHash := auth.HashToken(token)
-	expiresAt := time.Now().Add(h.cfg.RefreshTTL).Format("2006-01-02 15:04:05")
+	// 统一 UTC 写入，与 store 的 datetime('now') 及 isExpired 的解析口径一致
+	expiresAt := time.Now().UTC().Add(h.cfg.RefreshTTL).Format("2006-01-02 15:04:05")
 
 	_, err = h.store.CreateRefreshToken(ctx, &store.RefreshToken{
 		UserID:    userID,
@@ -294,6 +337,23 @@ func (h *AuthHandler) generateAndStoreRefreshToken(ctx context.Context, userID i
 		return "", err
 	}
 	return token, nil
+}
+
+// fallbackDummyHash 预生成的 Argon2id 哈希，仅在运行时生成 dummy 哈希失败时使用
+const fallbackDummyHash = "$argon2id$v=19$m=65536,t=3,p=2$uFemaSjzba+lBVn4BA5eyg$fp68HikkbKJD9z9y1i0ghXWBCfEamC2qAtpvZwt+xVg"
+
+// dummyVerifyHash 返回用于「用户不存在」登录路径的 dummy 哈希（惰性生成一次）
+// 使该路径与真实用户的密码校验耗时一致，抹平用户名枚举的时序差
+func (h *AuthHandler) dummyVerifyHash() string {
+	h.dummyOnce.Do(func() {
+		hash, err := h.hasher.Hash("timing-equalizer-dummy")
+		if err != nil {
+			h.logger.Error("生成 dummy 哈希失败", "error", err)
+			hash = fallbackDummyHash
+		}
+		h.dummyHash = hash
+	})
+	return h.dummyHash
 }
 
 // userResponse 用户信息响应（不含敏感字段）
@@ -329,8 +389,8 @@ func validateUsername(username string) error {
 
 // validatePassword 校验密码
 func validatePassword(password string) error {
-	if len(password) < 6 {
-		return errors.New("密码长度至少 6 字符")
+	if len(password) < 8 {
+		return errors.New("密码长度至少 8 字符")
 	}
 	if len(password) > 128 {
 		return errors.New("密码长度不能超过 128 字符")
@@ -345,13 +405,15 @@ func isDuplicateError(err error) bool {
 }
 
 // isExpired 检查过期时间字符串是否已过期
+// 时间字符串按 UTC 解析（与 store 的 datetime('now') 写入口径一致）；
+// 解析失败按已过期处理（fail-closed）
 func isExpired(expiresAt string) bool {
 	t, err := time.Parse("2006-01-02 15:04:05", strings.TrimSpace(expiresAt))
 	if err != nil {
 		// 尝试 RFC3339
 		t, err = time.Parse(time.RFC3339, strings.TrimSpace(expiresAt))
 		if err != nil {
-			return false // 解析失败不视为过期
+			return true // 解析失败视为已过期
 		}
 	}
 	return time.Now().After(t)

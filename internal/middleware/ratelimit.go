@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"net"
 	"net/http"
 	"strconv"
 	"sync"
@@ -111,13 +112,22 @@ func RateLimitByUser(limiter *RateLimiter) func(http.Handler) http.Handler {
 		if ac != nil {
 			return "user:" + strconv.FormatInt(ac.UserID, 10)
 		}
-		return "ip:" + r.RemoteAddr
+		return "ip:" + clientIP(r.RemoteAddr)
 	})
 }
 
 // RateLimitByIP 按 IP 限流
 func RateLimitByIP(limiter *RateLimiter) func(http.Handler) http.Handler {
 	return RateLimit(limiter, func(r *http.Request) string {
-		return "ip:" + r.RemoteAddr
+		return "ip:" + clientIP(r.RemoteAddr)
 	})
+}
+
+// clientIP 从 RemoteAddr（host:port）提取主机部分作为限流键，
+// 避免同一客户端因源端口变化而绕过限流；解析失败时返回原始值
+func clientIP(remoteAddr string) string {
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		return host
+	}
+	return remoteAddr
 }

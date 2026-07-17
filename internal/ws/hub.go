@@ -64,6 +64,9 @@ func (h *Hub) Run() {
 	for {
 		select {
 		case <-h.stop:
+			// 优雅关闭：逐个关闭所有已注册连接的 send channel，
+			// writePump 排空缓冲后退出，连接得以干净关闭
+			h.closeAllConnections()
 			h.logger.Info("WebSocket Hub 已停止")
 			h.running.Store(false)
 			return
@@ -87,6 +90,20 @@ func (h *Hub) Stop() {
 		// 已经关闭
 	default:
 		close(h.stop)
+	}
+}
+
+// closeAllConnections 关闭所有连接的 send channel 并清空注册表
+// 仅在 Run 循环内调用（hub goroutine 串行执行），与 handleUnregister 的 close 无竞态
+func (h *Hub) closeAllConnections() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for userID, conns := range h.connections {
+		for conn := range conns {
+			close(conn.send) // 通知 writePump 排空后退出
+			h.onlineCount.Add(-1)
+		}
+		delete(h.connections, userID)
 	}
 }
 

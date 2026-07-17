@@ -55,8 +55,8 @@ function UserIcon() {
 
 /* ============================== 工具函数 ============================== */
 
-/** 通过分页拉取所有条目并累加 size，计算存储用量 */
-async function computeUsage(): Promise<number> {
+/** 通过分页拉取所有条目并累加 size，计算存储用量；达到安全上限时标记 truncated */
+async function computeUsage(): Promise<{ total: number; truncated: boolean }> {
   let total = 0;
   let before: number | undefined;
   let pages = 0;
@@ -68,11 +68,12 @@ async function computeUsage(): Promise<number> {
     });
     const list = res.items ?? [];
     for (const it of list) total += it.size || 0;
-    if (list.length < 100) break;
+    if (list.length < 100) return { total, truncated: false };
     before = res.cursor;
     pages++;
   }
-  return total;
+  // 达到截断上限：实际用量可能更大，由调用方以 "≥" 展示
+  return { total, truncated: true };
 }
 
 function getErrorMessage(err: unknown, fallback: string): string {
@@ -105,6 +106,7 @@ export default function Settings() {
 
   const [profile, setProfile] = useState<User | null>(null);
   const [usage, setUsage] = useState(0);
+  const [usageTruncated, setUsageTruncated] = useState(false);
   const [usageLoading, setUsageLoading] = useState(true);
 
   // 密码
@@ -134,11 +136,13 @@ export default function Settings() {
   const fetchUsage = useCallback(async () => {
     setUsageLoading(true);
     try {
-      const total = await computeUsage();
+      const { total, truncated } = await computeUsage();
       setUsage(total);
+      setUsageTruncated(truncated);
     } catch {
       // 用量计算失败不阻塞页面
       setUsage(0);
+      setUsageTruncated(false);
     } finally {
       setUsageLoading(false);
     }
@@ -275,7 +279,9 @@ export default function Settings() {
             <>
               <div className="flex items-end justify-between">
                 <div className="flex items-baseline gap-2">
-                  <span className="text-2xl font-bold text-[var(--text-primary)]">{formatBytes(usage)}</span>
+                  <span className="text-2xl font-bold text-[var(--text-primary)]">
+                    {usageTruncated ? `≥ ${formatBytes(usage)}` : formatBytes(usage)}
+                  </span>
                   <span className="text-sm text-[var(--text-muted)]">/ {formatBytes(quota)}</span>
                 </div>
                 <span

@@ -26,6 +26,13 @@ import (
 // 返回已组装的路由处理器和 store（供测试中直接操作数据库）
 func apiTestSetup(t *testing.T, allowRegister string) (http.Handler, *store.Store) {
 	t.Helper()
+	handler, st, _ := apiTestSetupWithBlob(t, allowRegister)
+	return handler, st
+}
+
+// apiTestSetupWithBlob 同 apiTestSetup，额外返回 BlobStore（供断言文件落盘/清理）
+func apiTestSetupWithBlob(t *testing.T, allowRegister string) (http.Handler, *store.Store, blob.BlobStore) {
+	t.Helper()
 	ctx := context.Background()
 
 	cfg := &config.Config{
@@ -72,7 +79,7 @@ func apiTestSetup(t *testing.T, allowRegister string) (http.Handler, *store.Stor
 
 	// 直接用 Server 组装
 	server := New(cfg, st, bs, nil, log, jwtMgr, hasher, hub, nil, rl)
-	return server.Router(), st
+	return server.Router(), st, bs
 }
 
 // doRequest 辅助发送 HTTP 请求
@@ -160,20 +167,36 @@ func TestRegister_InviteMode(t *testing.T) {
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("状态码 = %d, 期望 201, body: %s", rec.Code, rec.Body.String())
 	}
+	resp := parseJSON(t, rec)
+	firstUser, _ := resp["user"].(map[string]any)
+	firstUserID := int64(firstUser["id"].(float64))
 
-	// 邀请码使用后再次使用应失败
+	// 邀请码应被标记为首个注册用户使用
+	codes, err := st.ListInviteCodes(ctx, 10, 0)
+	if err != nil {
+		t.Fatalf("查询邀请码失败: %v", err)
+	}
+	var found *store.InviteCode
+	for _, c := range codes {
+		if c.Code == "VALID123" {
+			found = c
+		}
+	}
+	if found == nil {
+		t.Fatal("应能查到邀请码 VALID123")
+	}
+	if !found.Used || !found.UsedBy.Valid || found.UsedBy.Int64 != firstUserID {
+		t.Errorf("used=%v used_by=%v, 期望 used=true 且 used_by=%d（首个注册用户）", found.Used, found.UsedBy, firstUserID)
+	}
+
+	// 邀请码使用后再次使用应严格返回 400
 	rec2 := doRequest(handler, "POST", "/api/auth/register", registerRequest{
 		Username:   "invited2",
 		Password:   "password123",
 		InviteCode: "VALID123",
 	}, "")
-	if rec2.Code != http.StatusCreated {
-		// 应该失败因为邀请码已用
-		if rec2.Code == http.StatusBadRequest {
-			// 符合预期
-		} else {
-			t.Fatalf("重复邀请码状态码 = %d, 期望 400", rec2.Code)
-		}
+	if rec2.Code != http.StatusBadRequest {
+		t.Fatalf("重复邀请码状态码 = %d, 期望 400", rec2.Code)
 	}
 }
 
@@ -653,6 +676,126 @@ func TestDevices_Unauthorized(t *testing.T) {
 	rec = doRequest(handler, "POST", "/api/devices", createDeviceRequest{Name: "test"}, "")
 	if rec.Code != http.StatusUnauthorized {
 		t.Errorf("状态码 = %d, 期望 401", rec.Code)
+	}
+}
+
+// --- 公开配置与认证限流测试 ---
+
+func TestPublicConfig(t *testing.T) {
+	handler, _ := apiTestSetup(t, "invite")
+
+	// 无需鉴权
+	rec := doRequest(handler, "GET", "/api/public/config", nil, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d, 期望 200", rec.Code)
+	}
+	resp := parseJSON(t, rec)
+	if resp["allow_register"] != "invite" {
+		t.Errorf("allow_register = %v, 期望 invite", resp["allow_register"])
+	}
+}
+
+func TestAuthRateLimit(t *testing.T) {
+	handler, _ := apiTestSetup(t, "open")
+
+	// 认证接口按 IP 限流（10 次/分钟，burst 10），同一 IP 第 11 次应 429
+	// 用非法用户名触发快速 400，避免 Argon2 开销拖慢测试
+	var lastCode int
+	for i := 0; i < 11; i++ {
+		rec := doRequest(handler, "POST", "/api/auth/register", registerRequest{
+			Username: "ab",
+			Password: "password123",
+		}, "")
+		lastCode = rec.Code
+	}
+	if lastCode != http.StatusTooManyRequests {
+		t.Errorf("第 11 次请求状态码 = %d, 期望 429", lastCode)
+	}
+}
+
+// --- 刷新与登出测试（补充） ---
+
+func TestRefresh_DisabledUser(t *testing.T) {
+	handler, st := apiTestSetup(t, "open")
+	ctx := context.Background()
+
+	hasher := auth.NewPasswordHasher(auth.DefaultArgon2Params())
+	hash, _ := hasher.Hash("password")
+	u, _ := st.CreateUser(ctx, &store.User{Username: "toggled", PasswordHash: hash})
+
+	// 登录获取 refresh token
+	rec := doRequest(handler, "POST", "/api/auth/login", loginRequest{
+		Username: "toggled",
+		Password: "password",
+	}, "")
+	loginResp := parseJSON(t, rec)
+	refreshToken, _ := loginResp["refresh_token"].(string)
+
+	// 禁用用户后刷新应 401
+	if err := st.UpdateUserStatus(ctx, u.ID, "disabled"); err != nil {
+		t.Fatalf("禁用用户失败: %v", err)
+	}
+	rec2 := doRequest(handler, "POST", "/api/auth/refresh", refreshRequest{
+		RefreshToken: refreshToken,
+	}, "")
+	if rec2.Code != http.StatusUnauthorized {
+		t.Fatalf("禁用用户刷新状态码 = %d, 期望 401", rec2.Code)
+	}
+
+	// 该 refresh token 应已被吊销：即使重新启用账号也不可再用
+	if err := st.UpdateUserStatus(ctx, u.ID, "active"); err != nil {
+		t.Fatalf("启用用户失败: %v", err)
+	}
+	rec3 := doRequest(handler, "POST", "/api/auth/refresh", refreshRequest{
+		RefreshToken: refreshToken,
+	}, "")
+	if rec3.Code != http.StatusUnauthorized {
+		t.Errorf("refresh token 应已被吊销, 状态码 = %d, 期望 401", rec3.Code)
+	}
+}
+
+// --- /api/me 测试（补充） ---
+
+func TestUpdateMe_Email(t *testing.T) {
+	handler, st := apiTestSetup(t, "open")
+	ctx := context.Background()
+
+	hasher := auth.NewPasswordHasher(auth.DefaultArgon2Params())
+	hash, _ := hasher.Hash("password")
+	u, _ := st.CreateUser(ctx, &store.User{Username: "emailme", PasswordHash: hash})
+	st.CreateUser(ctx, &store.User{Username: "emailother", PasswordHash: hash,
+		Email: sql.NullString{String: "taken@example.com", Valid: true}})
+
+	jwtMgr := auth.NewJWTManager("test-secret-at-least-32-bytes-long!!!", 15*time.Minute)
+	token, _ := jwtMgr.GenerateAccessToken(u.ID, u.Username, u.Role)
+
+	// 设置邮箱
+	email := "me@example.com"
+	rec := doRequest(handler, "PATCH", "/api/me", updateMeRequest{Email: &email}, token)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("设置邮箱状态码 = %d, 期望 200, body: %s", rec.Code, rec.Body.String())
+	}
+	resp := parseJSON(t, rec)
+	if resp["email"] != "me@example.com" {
+		t.Errorf("email = %v, 期望 me@example.com", resp["email"])
+	}
+
+	// 与他人邮箱冲突应 409
+	taken := "taken@example.com"
+	rec = doRequest(handler, "PATCH", "/api/me", updateMeRequest{Email: &taken}, token)
+	if rec.Code != http.StatusConflict {
+		t.Errorf("邮箱冲突状态码 = %d, 期望 409", rec.Code)
+	}
+
+	// 空串清空邮箱
+	empty := ""
+	rec = doRequest(handler, "PATCH", "/api/me", updateMeRequest{Email: &empty}, token)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("清空邮箱状态码 = %d, 期望 200, body: %s", rec.Code, rec.Body.String())
+	}
+	resp = parseJSON(t, rec)
+	if _, ok := resp["email"]; ok {
+		t.Errorf("清空后不应返回 email 字段, 实际 %v", resp["email"])
 	}
 }
 

@@ -27,24 +27,16 @@ import type { ClipItem } from '@/types';
 
 const MAX_DISPLAY = 10;
 
-/** 取当前访问令牌（用于二进制内容鉴权） */
+/** 取当前访问令牌（用于 WS 鉴权） */
 function authToken(): string {
   return tokenStorage.getAccessToken() ?? '';
 }
 
-function authHeaders(): HeadersInit {
-  const token = authToken();
-  return token ? { Authorization: `Bearer ${token}` } : {};
-}
-
-/** 下载条目内容：带鉴权拉取 blob 后触发下载 */
+/** 下载条目内容：带鉴权拉取 blob（内置 401 刷新重试）后触发下载 */
 async function downloadClipContent(id: number, filename: string): Promise<void> {
-  const res = await fetch(`/api/clip/${id}/content`, { headers: authHeaders() });
-  if (!res.ok) throw new Error('下载失败');
-  const blob = await res.blob();
-  const url = URL.createObjectURL(blob);
+  const blob = await api.getBlob(`/api/clip/${id}/content`);
   // downloadBlob 会在下载后自动回收 blob: URL
-  downloadBlob(url, filename);
+  downloadBlob(blob, filename);
 }
 
 /** 类型 → Badge 变体 */
@@ -57,7 +49,7 @@ function typeLabel(type: ClipItem['type']): string {
   return type === 'text' ? '文本' : type === 'image' ? '图片' : '文件';
 }
 
-/** 图片缩略图：带鉴权拉取 blob 并生成 objectURL，卸载时回收 */
+/** 图片缩略图：带鉴权拉取 blob 并生成 objectURL（内置 401 刷新重试），卸载时回收，失败可点击重试 */
 function ClipImage({
   id,
   onClick,
@@ -69,6 +61,7 @@ function ClipImage({
 }) {
   const [url, setUrl] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
+  const [retry, setRetry] = useState(0);
 
   useEffect(() => {
     let revoked = false;
@@ -76,8 +69,7 @@ function ClipImage({
     setUrl(null);
     setFailed(false);
 
-    fetch(`/api/clip/${id}/content`, { headers: authHeaders() })
-      .then((res) => (res.ok ? res.blob() : Promise.reject(new Error('fetch failed'))))
+    api.getBlob(`/api/clip/${id}/content`)
       .then((blob) => {
         if (revoked) return;
         objectUrl = URL.createObjectURL(blob);
@@ -91,12 +83,27 @@ function ClipImage({
       revoked = true;
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [id]);
+  }, [id, retry]);
 
   if (failed) {
     return (
-      <div className={cn('flex items-center justify-center text-xs text-[var(--text-muted)]', className)}>
-        <span>图片加载失败</span>
+      <div
+        role="button"
+        tabIndex={0}
+        onClick={(e) => {
+          e.stopPropagation();
+          setRetry((n) => n + 1);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.stopPropagation();
+            setRetry((n) => n + 1);
+          }
+        }}
+        className={cn('flex cursor-pointer items-center justify-center text-xs text-[var(--text-muted)] hover:text-[var(--text-secondary)]', className)}
+        title="点击重试"
+      >
+        <span>图片加载失败，点击重试</span>
       </div>
     );
   }
@@ -372,6 +379,8 @@ export default function Clipboard() {
     };
     wsClient.onClipDeleted = (id: number) => {
       removeById(id);
+      // 正在预览的条目被其他设备删除时，同步关闭预览弹窗
+      setPreviewItem((prev) => (prev && prev.id === id ? null : prev));
     };
     // 连接建立后请求增量同步，补齐初始加载与连接之间可能遗漏的条目
     wsClient.onConnected = () => {
@@ -458,9 +467,7 @@ export default function Clipboard() {
   const handleCopyBlob = async (item: ClipItem) => {
     setCopyingId(item.id);
     try {
-      const res = await fetch(`/api/clip/${item.id}/content`, { headers: authHeaders() });
-      if (!res.ok) throw new Error('获取内容失败');
-      const blob = await res.blob();
+      const blob = await api.getBlob(`/api/clip/${item.id}/content`);
       const ok = await copyBlobToClipboard(blob);
       if (ok) {
         toast.success(item.type === 'image' ? '图片已复制到剪切板' : '文件已复制到剪切板');

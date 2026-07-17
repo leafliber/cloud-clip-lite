@@ -92,7 +92,8 @@ func (h *MeHandler) UpdateMe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 修改密码
+	// 第一阶段：完成全部字段校验，不做任何写入，避免部分生效
+	var newHash string
 	if req.Password != nil {
 		if req.OldPassword == nil {
 			writeError(w, http.StatusBadRequest, "OLD_PASSWORD_REQUIRED", "修改密码需要提供旧密码")
@@ -109,29 +110,11 @@ func (h *MeHandler) UpdateMe(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "INVALID_PASSWORD", err.Error())
 			return
 		}
-		hash, err := h.hasher.Hash(*req.Password)
+		newHash, err = h.hasher.Hash(*req.Password)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "HASH_FAILED", "密码处理失败")
 			return
 		}
-		if err := h.store.UpdateUserPassword(r.Context(), ac.UserID, hash); err != nil {
-			handleError(w, err)
-			return
-		}
-		// 吊销所有 refresh token（强制重新登录）
-		_ = h.store.RevokeAllRefreshTokensByUser(r.Context(), ac.UserID)
-	}
-
-	// 修改邮箱
-	if req.Email != nil {
-		// 单独更新邮箱
-		var emailVal any
-		if *req.Email == "" {
-			emailVal = nil
-		} else {
-			emailVal = *req.Email
-		}
-		_ = emailVal // 邮箱更新在 settings 中合并处理
 	}
 
 	// 修改配额设置（仅管理员可改自己的配额，普通用户可改 retention_days）
@@ -173,6 +156,26 @@ func (h *MeHandler) UpdateMe(w http.ResponseWriter, r *http.Request) {
 		}
 		retention = *req.RetentionDays
 		needsSettingsUpdate = true
+	}
+
+	// 第二阶段：校验全部通过，开始落库
+	if req.Password != nil {
+		if err := h.store.UpdateUserPassword(r.Context(), ac.UserID, newHash); err != nil {
+			handleError(w, err)
+			return
+		}
+		// 吊销所有 refresh token（强制重新登录）
+		if err := h.store.RevokeAllRefreshTokensByUser(r.Context(), ac.UserID); err != nil {
+			h.logger.Error("吊销用户 Refresh Token 失败", "error", err, "user_id", ac.UserID)
+		}
+	}
+
+	// 修改邮箱（空串清除；唯一约束冲突由 handleError 映射为 409）
+	if req.Email != nil {
+		if err := h.store.UpdateUserEmail(r.Context(), ac.UserID, *req.Email); err != nil {
+			handleError(w, err)
+			return
+		}
 	}
 
 	if needsSettingsUpdate {

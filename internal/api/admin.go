@@ -69,6 +69,10 @@ func (h *AdminHandler) ListUsers(w http.ResponseWriter, r *http.Request) {
 	if limit <= 0 || limit > 100 {
 		limit = 20
 	}
+	// 负 offset 在 PG 下会直接报错，按 0 处理
+	if offset < 0 {
+		offset = 0
+	}
 
 	users, err := h.store.ListUsers(r.Context(), limit, offset)
 	if err != nil {
@@ -120,14 +124,54 @@ func (h *AdminHandler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 逐字段更新
 	ac := middleware.GetAuthContext(r.Context())
 
-	if req.Role != nil {
-		if *req.Role != "user" && *req.Role != "admin" {
-			writeError(w, http.StatusBadRequest, "INVALID_ROLE", "角色必须为 user 或 admin")
+	// 第一阶段：完成全部字段校验，不做任何写入，避免部分生效
+
+	// 管理员不能修改自己的角色与状态，防止唯一管理员自我锁死（配额等字段放行）
+	if ac != nil && ac.UserID == id && (req.Role != nil || req.Status != nil) {
+		writeError(w, http.StatusBadRequest, "SELF_EDIT_FORBIDDEN", "不能修改自己的角色或状态")
+		return
+	}
+
+	if req.Role != nil && *req.Role != "user" && *req.Role != "admin" {
+		writeError(w, http.StatusBadRequest, "INVALID_ROLE", "角色必须为 user 或 admin")
+		return
+	}
+
+	if req.Status != nil && *req.Status != "active" && *req.Status != "disabled" {
+		writeError(w, http.StatusBadRequest, "INVALID_STATUS", "状态必须为 active 或 disabled")
+		return
+	}
+
+	// 配额字段按 /me 同一标准校验，避免 0/负数导致恒 413/恒 403/即建即过期
+	maxSize := target.MaxItemSize
+	quota := target.QuotaBytes
+	retention := target.RetentionDays
+	if req.MaxItemSize != nil {
+		if *req.MaxItemSize <= 0 || *req.MaxItemSize > h.cfg.DefaultMaxItemSize*10 {
+			writeError(w, http.StatusBadRequest, "INVALID_VALUE", "单条上限取值非法")
 			return
 		}
+		maxSize = *req.MaxItemSize
+	}
+	if req.QuotaBytes != nil {
+		if *req.QuotaBytes <= 0 {
+			writeError(w, http.StatusBadRequest, "INVALID_VALUE", "总配额取值非法")
+			return
+		}
+		quota = *req.QuotaBytes
+	}
+	if req.RetentionDays != nil {
+		if *req.RetentionDays < 1 || *req.RetentionDays > 3650 {
+			writeError(w, http.StatusBadRequest, "INVALID_VALUE", "保留天数需在 1-3650 之间")
+			return
+		}
+		retention = *req.RetentionDays
+	}
+
+	// 第二阶段：校验全部通过，开始落库
+	if req.Role != nil {
 		if err := h.store.UpdateUserRole(r.Context(), id, *req.Role); err != nil {
 			h.logger.Error("更新用户角色失败", "error", err)
 			writeError(w, http.StatusInternalServerError, "UPDATE_FAILED", "更新角色失败")
@@ -137,10 +181,6 @@ func (h *AdminHandler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Status != nil {
-		if *req.Status != "active" && *req.Status != "disabled" {
-			writeError(w, http.StatusBadRequest, "INVALID_STATUS", "状态必须为 active 或 disabled")
-			return
-		}
 		if err := h.store.UpdateUserStatus(r.Context(), id, *req.Status); err != nil {
 			h.logger.Error("更新用户状态失败", "error", err)
 			writeError(w, http.StatusInternalServerError, "UPDATE_FAILED", "更新状态失败")
@@ -150,18 +190,6 @@ func (h *AdminHandler) UpdateUser(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.MaxItemSize != nil || req.QuotaBytes != nil || req.RetentionDays != nil {
-		maxSize := target.MaxItemSize
-		quota := target.QuotaBytes
-		retention := target.RetentionDays
-		if req.MaxItemSize != nil {
-			maxSize = *req.MaxItemSize
-		}
-		if req.QuotaBytes != nil {
-			quota = *req.QuotaBytes
-		}
-		if req.RetentionDays != nil {
-			retention = *req.RetentionDays
-		}
 		if err := h.store.UpdateUserSettings(r.Context(), id, maxSize, quota, retention); err != nil {
 			h.logger.Error("更新用户配额失败", "error", err)
 			writeError(w, http.StatusInternalServerError, "UPDATE_FAILED", "更新配额失败")
@@ -215,8 +243,10 @@ func (h *AdminHandler) ResetPassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 强制下线：吊销所有 refresh token
-	_ = h.store.RevokeAllRefreshTokensByUser(r.Context(), id)
+	// 强制下线：吊销所有 refresh token（失败仅记日志，密码已重置成功）
+	if err := h.store.RevokeAllRefreshTokensByUser(r.Context(), id); err != nil {
+		h.logger.Error("吊销用户 Refresh Token 失败", "error", err, "user_id", id)
+	}
 
 	ac := middleware.GetAuthContext(r.Context())
 	h.audit(r, ac, "admin.user.reset_password", target.Username)
@@ -292,6 +322,10 @@ func (h *AdminHandler) ListAuditLogs(w http.ResponseWriter, r *http.Request) {
 	offset, _ := strconv.Atoi(r.URL.Query().Get("offset"))
 	if limit <= 0 || limit > 100 {
 		limit = 50
+	}
+	// 负 offset 在 PG 下会直接报错，按 0 处理
+	if offset < 0 {
+		offset = 0
 	}
 
 	logs, err := h.store.ListAuditLogs(r.Context(), userID, action, limit, offset)

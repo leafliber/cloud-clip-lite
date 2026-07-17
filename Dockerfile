@@ -19,7 +19,7 @@ COPY web/ ./
 RUN npm run build
 
 # ---- 阶段 2: Go 编译 ----
-FROM golang:1.24-alpine AS go-builder
+FROM golang:1.26-alpine AS go-builder
 
 WORKDIR /app
 
@@ -33,14 +33,20 @@ RUN go mod download
 # 复制源码
 COPY . .
 
-# 复制前端构建产物（嵌入到二进制中）
+# 复制前端构建产物到 ./web/dist，由 Go 进程从磁盘伺服
 COPY --from=frontend-builder /app/web/dist ./web/dist
 
+# 目标架构（buildx 自动注入，默认 amd64 兼容非 buildx 构建）
+ARG TARGETARCH=amd64
+
 # 静态编译（CGO_ENABLED=0 适配 distroless）
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=$TARGETARCH go build \
     -ldflags="-s -w -X main.Version=docker" \
     -o /app/bin/server \
     ./cmd/server/
+
+# 预建数据目录并归属 nonroot（uid 65532），确保最终镜像挂载卷后 nonroot 可写
+RUN mkdir -p /app/data && chown 65532:65532 /app/data
 
 # ---- 阶段 3: 最终运行镜像 ----
 FROM gcr.io/distroless/static-debian12:nonroot
@@ -54,7 +60,11 @@ WORKDIR /app
 # 复制二进制
 COPY --from=go-builder /app/bin/server /app/server
 
-# 数据目录
+# 复制前端构建产物到工作目录下的 ./web/dist，由 Go 进程从磁盘伺服
+COPY --from=frontend-builder /app/web/dist /app/web/dist
+
+# 数据目录（从 builder 带入属主为 nonroot 的空目录，命名卷初始化后 nonroot 可写）
+COPY --from=go-builder --chown=nonroot:nonroot /app/data /app/data
 USER nonroot:nonroot
 VOLUME ["/app/data"]
 

@@ -175,32 +175,52 @@ class ApiClient {
   }
 
   private async doRefresh(): Promise<boolean> {
-    const refreshToken = tokenStorage.getRefreshToken();
+    let refreshToken = tokenStorage.getRefreshToken();
     if (!refreshToken) {
       this.handleAuthFailure();
       return false;
     }
-    try {
-      const res = await fetch('/api/auth/refresh', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ refresh_token: refreshToken }),
-      });
-      if (!res.ok) {
+    // 最多尝试两次：第二次仅在 refresh token 被其他标签页轮转后重试
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let res: Response;
+      try {
+        res = await fetch('/api/auth/refresh', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ refresh_token: refreshToken }),
+        });
+      } catch {
+        // 网络错误/服务器不可达：保留本地凭证，不当作会话失效
+        return false;
+      }
+      if (res.ok) {
+        try {
+          const data = await res.json();
+          if (data.access_token && data.refresh_token) {
+            tokenStorage.setTokens(data.access_token, data.refresh_token);
+            return true;
+          }
+        } catch {
+          // 响应解析失败：按刷新失败处理，但保留凭证
+        }
+        return false;
+      }
+      if (res.status === 401) {
+        // 多标签页并发 refresh：后端轮转吊销旧 token 后，其他标签页可能已写入新
+        // token。若 localStorage 中的 refresh token 与本次使用的不一样，用它重试一次。
+        const latest = tokenStorage.getRefreshToken();
+        if (attempt === 0 && latest && latest !== refreshToken) {
+          refreshToken = latest;
+          continue;
+        }
+        // 明确的 401：会话确实失效
         this.handleAuthFailure();
         return false;
       }
-      const data = await res.json();
-      if (data.access_token && data.refresh_token) {
-        tokenStorage.setTokens(data.access_token, data.refresh_token);
-        return true;
-      }
-      this.handleAuthFailure();
-      return false;
-    } catch {
-      this.handleAuthFailure();
+      // 5xx 等其他错误：保留凭证，下次再试
       return false;
     }
+    return false;
   }
 
   /** 鉴权失败：清除凭证并跳转登录页 */
@@ -213,6 +233,30 @@ class ApiClient {
 
   get<T>(path: string, params?: Record<string, any>): Promise<T> {
     return this.request<T>('GET', path, { params });
+  }
+
+  /**
+   * 拉取二进制内容（Blob），与 request 一样内置 401 → refresh → 重试。
+   * 用于图片缩略图、文件下载等二进制端点。
+   */
+  async getBlob(path: string, params?: Record<string, any>): Promise<Blob> {
+    const url = `${path}${buildQuery(params)}`;
+    const doFetch = (): Promise<Response> => {
+      const headers: Record<string, string> = {};
+      const token = tokenStorage.getAccessToken();
+      if (token) headers['Authorization'] = `Bearer ${token}`;
+      return fetch(url, { method: 'GET', headers });
+    };
+
+    let res = await doFetch();
+    if (res.status === 401 && !this.isAuthEndpoint(path)) {
+      const refreshed = await this.tryRefresh();
+      if (refreshed) res = await doFetch();
+    }
+    if (!res.ok) {
+      throw await parseError(res);
+    }
+    return res.blob();
   }
 
   post<T>(path: string, body?: any, isForm?: boolean): Promise<T> {

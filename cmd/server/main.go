@@ -27,6 +27,9 @@ import (
 	"github.com/leaf/cloud-clip-lite/internal/ws"
 )
 
+// Version 构建版本号，通过 -ldflags "-X main.Version=xxx" 注入，默认 dev
+var Version = "dev"
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "启动失败: %v\n", err)
@@ -51,6 +54,16 @@ func run() error {
 		"blob_store", cfg.BlobStore,
 		"allow_register", cfg.AllowRegister,
 	)
+
+	// 生产环境下 ALLOWED_ORIGINS=* 允许任意源跨域，属于危险配置，醒目警告（不阻断启动）
+	if cfg.IsProduction() {
+		for _, o := range cfg.AllowedOrigins {
+			if o == "*" {
+				log.Warn("安全警告：生产环境 ALLOWED_ORIGINS 配置为 *，允许任意来源跨域访问，强烈建议配置明确的域名列表")
+				break
+			}
+		}
+	}
 
 	// 3. 确保数据目录存在（SQLite 与本地 Blob 共用）
 	if err := ensureDirs(cfg); err != nil {
@@ -93,12 +106,16 @@ func run() error {
 		KeyLength:   32,
 	})
 
-	// 管理员引导（首次启动）
-	if err := bootstrapAdmin(ctx, st, hasher, cfg, log); err != nil {
-		log.Error("管理员引导失败", "error", err)
+	// 管理员引导（首次启动）：使用独立 30s context，
+	// 不与 db.Open/迁移共享超时预算，避免被前序步骤耗尽而 deadline exceeded
+	bootCtx, bootCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	err = bootstrapAdmin(bootCtx, st, hasher, cfg, log)
+	bootCancel()
+	if err != nil {
+		log.Error("管理员引导失败，管理员账号未创建", "error", err)
 	}
 
-	healthHandler := health.New(st, ready)
+	healthHandler := health.NewWithVersion(st, ready, Version)
 
 	// 对象存储
 	var blobStore blob.BlobStore

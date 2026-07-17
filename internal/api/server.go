@@ -3,6 +3,10 @@ package api
 import (
 	"log/slog"
 	"net/http"
+	"os"
+	"path"
+	"path/filepath"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/leaf/cloud-clip-lite/internal/auth"
@@ -67,9 +71,15 @@ func (s *Server) Router() http.Handler {
 
 	// API 路由组
 	r.Route("/api", func(r chi.Router) {
-		// 认证路由（无需鉴权，但限流防暴力破解）
+		// 公开配置探测（前端据此决定注册入口，无需鉴权）
+		r.Get("/public/config", s.PublicConfig)
+
+		// 认证路由（无需鉴权，但按 IP 限流防暴力破解与 Argon2 资源耗尽 DoS）
 		authHandler := NewAuthHandler(s.cfg, s.store, s.jwtMgr, s.hasher, s.logger)
-		authHandler.RegisterRoutes(r)
+		r.Group(func(r chi.Router) {
+			r.Use(middleware.RateLimitByIP(middleware.NewRateLimiter(10, 10)))
+			authHandler.RegisterRoutes(r)
+		})
 
 		// WebSocket 路由（独立鉴权，不走 RequireAuth 中间件）
 		if s.hub != nil {
@@ -104,7 +114,45 @@ func (s *Server) Router() http.Handler {
 		})
 	})
 
+	// 前端静态资源：工作目录下 ./web/dist 存在时伺服（Docker 镜像内工作目录为 /app），
+	// 未命中文件的 GET 请求回退 index.html（React Router 客户端路由）
+	if _, err := os.Stat(webDistDir); err == nil {
+		r.Get("/*", spaHandler(webDistDir))
+	}
+
 	return r
+}
+
+// PublicConfig GET /api/public/config — 公开配置探测
+func (s *Server) PublicConfig(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"allow_register": s.cfg.AllowRegister,
+	})
+}
+
+// webDistDir 前端构建产物目录（相对进程工作目录）
+const webDistDir = "./web/dist"
+
+// spaHandler 伺服前端静态文件，未命中时回退 index.html（SPA fallback）
+// API 与运维端点不进入静态伺服
+func spaHandler(root string) http.HandlerFunc {
+	fs := http.FileServer(http.Dir(root))
+	return func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		if strings.HasPrefix(p, "/api/") || p == "/healthz" || p == "/readyz" || p == "/metrics" {
+			http.NotFound(w, r)
+			return
+		}
+		// path.Clean 消除 ../ 等穿越；命中真实文件则直接伺服
+		name := strings.TrimPrefix(path.Clean(p), "/")
+		if name != "" && name != "." {
+			if fi, err := os.Stat(filepath.Join(root, name)); err == nil && !fi.IsDir() {
+				fs.ServeHTTP(w, r)
+				return
+			}
+		}
+		http.ServeFile(w, r, filepath.Join(root, "index.html"))
+	}
 }
 
 // ping 简单连通性测试
