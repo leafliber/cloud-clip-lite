@@ -101,6 +101,30 @@ export async function copyToClipboard(text: string): Promise<boolean> {
 }
 
 /**
+ * 复制 Blob（图片/文件二进制）到系统剪贴板。
+ *
+ * 使用 Clipboard API 的 ClipboardItem 写入，要求安全上下文（HTTPS / localhost）。
+ * 浏览器仅支持有限的 MIME 类型（如 image/png、image/jpeg 等），不支持的类型会抛出异常，
+ * 调用方应自行处理回退逻辑（如复制文件名）。
+ *
+ * @returns 是否复制成功
+ */
+export async function copyBlobToClipboard(blob: Blob): Promise<boolean> {
+  try {
+    if (navigator.clipboard && window.isSecureContext && typeof ClipboardItem !== 'undefined') {
+      const mimeType = blob.type || 'application/octet-stream';
+      const clipboardBlob = blob.type ? blob : new Blob([blob], { type: mimeType });
+      const item = new ClipboardItem({ [mimeType]: clipboardBlob });
+      await navigator.clipboard.write([item]);
+      return true;
+    }
+  } catch {
+    // 不支持或 MIME 类型不被浏览器允许，落入回退逻辑
+  }
+  return false;
+}
+
+/**
  * 安全下载：通过临时 <a> 标签触发下载，rel 防止 tabnabbing。
  * source 可为 Blob（自动创建 object URL）或字符串 URL（如 blob:/data:）。
  * 若为 blob: 链接，下载完成后自动回收。

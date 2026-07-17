@@ -9,6 +9,7 @@ import {
   formatTime,
   timeAgo,
   copyToClipboard,
+  copyBlobToClipboard,
   downloadBlob,
   cn,
 } from '@/lib/security';
@@ -135,17 +136,21 @@ function FileIcon() {
 function ClipCard({
   item,
   onCopy,
+  onCopyBlob,
   onPreview,
   onDelete,
   onDownload,
   deleting,
+  copying,
 }: {
   item: ClipItem;
   onCopy: (text: string) => void;
+  onCopyBlob: (item: ClipItem) => void;
   onPreview: (item: ClipItem) => void;
   onDelete: (item: ClipItem) => void;
   onDownload: (item: ClipItem) => void;
   deleting: boolean;
+  copying: boolean;
 }) {
   const filename = item.meta?.filename || '未命名文件';
   const textPreview = (item.text ?? '').slice(0, 240);
@@ -231,12 +236,44 @@ function ClipCard({
           {item.type === 'image' && (
             <button
               type="button"
+              onClick={() => onCopyBlob(item)}
+              disabled={copying}
+              className="rounded-md p-1.5 text-[var(--text-muted)] opacity-0 transition hover:bg-[var(--bg-hover)] hover:text-[var(--brand-400)] focus-ring group-hover:opacity-100 disabled:opacity-50"
+              title="复制图片"
+              aria-label="复制图片"
+            >
+              {copying ? (
+                <Spinner size="sm" className="!h-[15px] !w-[15px] !border" />
+              ) : (
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
+              )}
+            </button>
+          )}
+          {item.type === 'image' && (
+            <button
+              type="button"
               onClick={() => onDownload(item)}
               className="rounded-md p-1.5 text-[var(--text-muted)] opacity-0 transition hover:bg-[var(--bg-hover)] hover:text-[var(--brand-400)] focus-ring group-hover:opacity-100"
               title="下载"
               aria-label="下载"
             >
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" /><polyline points="7 10 12 15 17 10" /><line x1="12" y1="15" x2="12" y2="3" /></svg>
+            </button>
+          )}
+          {item.type === 'file' && (
+            <button
+              type="button"
+              onClick={() => onCopyBlob(item)}
+              disabled={copying}
+              className="rounded-md p-1.5 text-[var(--text-muted)] opacity-0 transition hover:bg-[var(--bg-hover)] hover:text-[var(--brand-400)] focus-ring group-hover:opacity-100 disabled:opacity-50"
+              title="复制"
+              aria-label="复制"
+            >
+              {copying ? (
+                <Spinner size="sm" className="!h-[15px] !w-[15px] !border" />
+              ) : (
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" /></svg>
+              )}
             </button>
           )}
           <button
@@ -300,6 +337,7 @@ export default function History() {
   const [loadingFirst, setLoadingFirst] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [deletingId, setDeletingId] = useState<number | null>(null);
+  const [copyingId, setCopyingId] = useState<number | null>(null);
   const [previewItem, setPreviewItem] = useState<ClipItem | null>(null);
 
   const itemsRef = useRef<ClipItem[]>(items);
@@ -413,6 +451,30 @@ export default function History() {
     else toast.error('复制失败');
   };
 
+  /** 复制图片/文件 Blob 到系统剪贴板，不支持时回退复制文件名 */
+  const handleCopyBlob = async (item: ClipItem) => {
+    setCopyingId(item.id);
+    try {
+      const res = await fetch(`/api/clip/${item.id}/content`, { headers: authHeaders() });
+      if (!res.ok) throw new Error('获取内容失败');
+      const blob = await res.blob();
+      const ok = await copyBlobToClipboard(blob);
+      if (ok) {
+        toast.success(item.type === 'image' ? '图片已复制到剪切板' : '文件已复制到剪切板');
+      } else {
+        // 浏览器不支持该 MIME 类型直接复制，回退复制文件名
+        const filename = item.meta?.filename || `clip-${item.id}`;
+        const fallback = await copyToClipboard(String(filename));
+        if (fallback) toast.success('不支持此类型直接复制，已复制文件名');
+        else toast.error('复制失败');
+      }
+    } catch {
+      toast.error('复制失败');
+    } finally {
+      setCopyingId(null);
+    }
+  };
+
   const handleDownload = async (item: ClipItem) => {
     const filename = item.meta?.filename || `clip-${item.id}`;
     try {
@@ -522,10 +584,12 @@ export default function History() {
                 key={item.id}
                 item={item}
                 onCopy={handleCopy}
+                onCopyBlob={handleCopyBlob}
                 onPreview={setPreviewItem}
                 onDelete={handleDelete}
                 onDownload={handleDownload}
                 deleting={deletingId === item.id}
+                copying={copyingId === item.id}
               />
             ))}
           </div>
