@@ -39,6 +39,7 @@ pub struct ApiClient {
 impl ApiClient {
     pub fn new(server_url: String, token_store: Arc<Mutex<TokenStore>>) -> Self {
         let client = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("Failed to build HTTP client");
@@ -48,6 +49,46 @@ impl ApiClient {
             server_url,
             token_store,
         }
+    }
+
+    /// 健康检查：检测服务器是否可达（5 秒超时）
+    /// 成功返回服务器版本号
+    pub async fn health_check(server_url: &str) -> Result<String, ApiError> {
+        let client = Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+            .map_err(|e| ApiError::Network(e.to_string()))?;
+
+        let url = format!("{}/healthz", server_url.trim_end_matches('/'));
+        let resp = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| ApiError::Network(format!("无法连接服务器: {}", e)))?;
+
+        if !resp.status().is_success() {
+            return Err(ApiError::Other(format!(
+                "服务器响应异常 ({})",
+                resp.status()
+            )));
+        }
+
+        let data: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| ApiError::Other(format!("响应格式错误: {}", e)))?;
+
+        Ok(data["version"].as_str().unwrap_or("unknown").to_string())
+    }
+
+    /// 规范化服务器地址：去空格、去尾部斜杠、补全 http:// 前缀
+    pub fn normalize_server_url(input: &str) -> String {
+        let mut url = input.trim().trim_end_matches('/').to_string();
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            url = format!("http://{}", url);
+        }
+        url
     }
 
     /// 获取当前 access token

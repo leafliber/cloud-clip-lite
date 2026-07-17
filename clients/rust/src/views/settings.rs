@@ -15,6 +15,8 @@ pub struct SettingsView {
     pub show_old: bool,
     pub show_new: bool,
     pub password_error: Option<String>,
+    /// 服务器地址编辑缓冲
+    pub server_url: String,
 }
 
 impl SettingsView {
@@ -102,6 +104,48 @@ impl SettingsView {
                         ui.label(&user.created_at);
                     });
                 }
+            });
+
+        ui.add_space(16.0);
+
+        // 服务器设置
+        if self.server_url.is_empty() {
+            self.server_url = app.config().server_url.clone();
+        }
+        egui::Frame::group(ui.style())
+            .inner_margin(egui::Margin::same(12.0))
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new("服务器")
+                        .strong()
+                        .size(14.0),
+                );
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    ui.label("地址");
+                    ui.add_space(20.0);
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.server_url)
+                            .desired_width(240.0)
+                            .hint_text("http://localhost:8080"),
+                    );
+
+                    let url = self.server_url.trim().to_string();
+                    let changed = !url.is_empty() && url != app.config().server_url;
+                    if ui
+                        .add_enabled(changed, egui::Button::new("保存并切换"))
+                        .clicked()
+                    {
+                        app.switch_server(url);
+                    }
+                });
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("切换服务器后将断开连接并退出登录，需使用新服务器的账号重新登录")
+                        .small()
+                        .weak(),
+                );
             });
 
         ui.add_space(16.0);

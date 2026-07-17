@@ -18,9 +18,22 @@ pub enum Tab {
     Settings,
 }
 
+/// 应用阶段：先选择并连通服务器，再进入会话（登录/主界面）
+#[derive(Debug, Clone, PartialEq)]
+pub enum Stage {
+    /// 服务器选择（启动第一步）
+    Server,
+    /// 会话阶段（恢复会话 / 登录 / 主界面）
+    Session,
+}
+
 /// 异步任务结果（通过 channel 发送给 UI）
 #[derive(Debug)]
 pub enum TaskResult {
+    /// 服务器连接检测成功
+    ServerCheckOk { url: String, version: String },
+    /// 服务器连接检测失败
+    ServerCheckErr(String),
     /// 登录成功
     LoginOk(AuthResponse),
     /// 登录失败
@@ -65,6 +78,8 @@ pub struct App {
     api: ApiClient,
     /// Tokio runtime handle
     rt: tokio::runtime::Handle,
+    /// 当前应用阶段
+    stage: Stage,
     /// 当前登录用户
     user: Option<User>,
     /// 当前视图标签
@@ -83,13 +98,11 @@ pub struct App {
     ws_rx: Option<tokio::sync::mpsc::UnboundedReceiver<WsEvent>>,
 
     // 视图状态
+    server_view: views::ServerView,
     login_view: views::LoginView,
     clipboard_view: views::ClipboardView,
     history_view: views::HistoryView,
     settings_view: views::SettingsView,
-
-    // 初始化状态
-    initialized: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -115,10 +128,14 @@ impl App {
         // 配置 egui 主题与字体
         configure_fonts(&cc.egui_ctx);
 
+        let mut server_view = views::ServerView::default();
+        server_view.url = config.server_url.clone();
+
         Self {
             config,
             api,
             rt: rt_handle,
+            stage: Stage::Server,
             user: None,
             current_tab: Tab::Clipboard,
             loading: false,
@@ -127,11 +144,11 @@ impl App {
             task_rx,
             task_tx,
             ws_rx: None,
+            server_view,
             login_view: views::LoginView::default(),
             clipboard_view: views::ClipboardView::default(),
             history_view: views::HistoryView::default(),
             settings_view: views::SettingsView::default(),
-            initialized: false,
         }
     }
 
@@ -185,6 +202,39 @@ impl App {
         // 重建 API 客户端（保持 token store）
         let token_store = self.api.token_store_clone();
         self.api = ApiClient::new(url, token_store);
+        // 同步服务器选择页的编辑缓冲
+        self.server_view.url = self.config.server_url.clone();
+    }
+
+    /// 切换服务器：保存新地址、断开 WebSocket、清除本地会话并回到登录页
+    pub fn switch_server(&mut self, url: String) {
+        self.set_server_url(url);
+        self.stop_ws();
+        // 清除本地 token（旧服务器的凭证对新服务器无效）
+        let token_store = self.api.token_store_clone();
+        self.rt.block_on(async move {
+            let mut t = token_store.lock().await;
+            *t = TokenStore::default();
+            let _ = t.save();
+        });
+        self.user = None;
+        self.clipboard_view.reset();
+        self.history_view.reset();
+        // 回到服务器选择页，让用户确认新服务器后再登录
+        self.stage = Stage::Server;
+        self.server_view.checking = false;
+        self.server_view.error = None;
+        self.show_toast(ToastKind::Info, "服务器已切换，请重新连接并登录");
+    }
+
+    /// 返回服务器选择页（不断开配置，仅回到第一阶段）
+    pub fn back_to_server_stage(&mut self) {
+        self.stop_ws();
+        self.user = None;
+        self.stage = Stage::Server;
+        self.server_view.url = self.config.server_url.clone();
+        self.server_view.checking = false;
+        self.server_view.error = None;
     }
 
     /// 启动 WebSocket 连接
@@ -212,6 +262,21 @@ impl App {
     fn process_task_results(&mut self, ctx: &egui::Context) {
         while let Ok(result) = self.task_rx.try_recv() {
             match result {
+                TaskResult::ServerCheckOk { url, version } => {
+                    self.server_view.checking = false;
+                    self.set_server_url(url);
+                    self.stage = Stage::Session;
+                    self.show_toast(ToastKind::Success, format!("已连接服务器 (版本 {})", version));
+                    // 有本地 token 则尝试恢复会话，否则直接进入登录页
+                    let has_token = self.rt.block_on(self.api.get_access_token()).is_some();
+                    if has_token {
+                        self.try_restore_session();
+                    }
+                }
+                TaskResult::ServerCheckErr(e) => {
+                    self.server_view.checking = false;
+                    self.server_view.error = Some(e);
+                }
                 TaskResult::LoginOk(auth) => {
                     self.user = Some(auth.user);
                     self.loading = false;
@@ -492,12 +557,6 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // 初始化（只执行一次）
-        if !self.initialized {
-            self.initialized = true;
-            self.try_restore_session();
-        }
-
         // 处理异步结果
         self.process_task_results(ctx);
         self.process_ws_events();
@@ -508,7 +567,13 @@ impl eframe::App for App {
         // 显示 toast
         self.render_toast(ctx);
 
-        // 根据状态渲染
+        // 第一阶段：选择并连通服务器
+        if self.stage == Stage::Server {
+            self.render_server(ctx);
+            return;
+        }
+
+        // 第二阶段：会话（恢复中 → 登录 → 主界面）
         if self.loading && self.user.is_none() {
             self.render_loading(ctx);
             return;
@@ -523,19 +588,7 @@ impl eframe::App for App {
 }
 
 impl App {
-    fn render_loading(&self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(200.0);
-                ui.spinner();
-                ui.add_space(10.0);
-                ui.label("正在连接服务器…");
-            });
-        });
-    }
-
-    fn render_login(&mut self, ctx: &egui::Context) {
-        // 服务器设置区域
+    fn render_server(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.add_space(40.0);
             ui.vertical_centered(|ui| {
@@ -547,13 +600,51 @@ impl App {
                 );
                 ui.add_space(20.0);
 
-                // 服务器地址输入
+                let mut view = std::mem::take(&mut self.server_view);
+                view.render(ui, self);
+                self.server_view = view;
+            });
+        });
+    }
+}
+
+impl App {
+    fn render_loading(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(200.0);
+                ui.spinner();
+                ui.add_space(10.0);
+                ui.label("正在恢复会话…");
+                ui.add_space(20.0);
+                if ui.button("取消").clicked() {
+                    self.loading = false;
+                }
+            });
+        });
+    }
+
+    fn render_login(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(40.0);
+            ui.vertical_centered(|ui| {
+                ui.heading("Cloud Clip Lite");
+                ui.add_space(5.0);
+                ui.label(
+                    egui::RichText::new("跨平台剪切板客户端")
+                        .weak(),
+                );
+                ui.add_space(20.0);
+
+                // 当前服务器 + 更换入口
                 ui.horizontal(|ui| {
-                    ui.label("服务器");
-                    let mut url = self.config.server_url.clone();
-                    ui.add(egui::TextEdit::singleline(&mut url).desired_width(300.0));
-                    if url != self.config.server_url {
-                        self.set_server_url(url);
+                    ui.label(
+                        egui::RichText::new(format!("服务器：{}", self.config.server_url))
+                            .small()
+                            .weak(),
+                    );
+                    if ui.small_button("更换").clicked() {
+                        self.back_to_server_stage();
                     }
                 });
                 ui.add_space(15.0);
@@ -694,7 +785,7 @@ impl App {
                 .show(ctx, |ui| {
                     egui::Frame::popup(ui.style())
                         .fill(egui::Color32::from_rgb(31, 31, 35))
-                        .stroke(egui::Stroke::new(1.0, color))
+                        .stroke(egui::Stroke::new(1.0_f32, color))
                         .inner_margin(egui::Margin::same(12.0))
                         .show(ui, |ui| {
                             ui.horizontal(|ui| {

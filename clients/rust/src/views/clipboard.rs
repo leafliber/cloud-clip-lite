@@ -282,7 +282,7 @@ impl ClipboardView {
             }
 
             // 在循环外执行操作
-            for (id, text) in to_copy {
+            for (_id, text) in to_copy {
                 copy_to_clipboard(&text);
                 app.show_toast(crate::app::ToastKind::Success, "已复制到剪贴板");
             }
